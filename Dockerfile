@@ -1,4 +1,4 @@
-FROM golang:1.23.4 AS builder
+FROM golang:1.23.4@sha256:9820aca42262f58451f006de3213055974b36f24b31508c1baa73c967fcecb99 AS builder
 
 RUN apt-get -qq update && \
     apt-get -yqq install curl -y
