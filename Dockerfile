@@ -1,7 +1,4 @@
-FROM golang:1.23.4 AS builder
-
-RUN apt-get -qq update && \
-    apt-get -yqq install curl -y
+FROM golang:1.25.6 AS builder
 
 ENV GO111MODULE=on \
   CGO_ENABLED=0 \
@@ -10,7 +7,11 @@ ENV GO111MODULE=on \
 
 WORKDIR /src
 
-COPY . .
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY main.go .
 RUN go build \
   -a \
   -trimpath \
