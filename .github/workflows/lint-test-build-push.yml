@@ -1,4 +1,4 @@
-name: build-push-ar
+name: build-push
 on:
   push:
 jobs:
@@ -7,33 +7,23 @@ jobs:
       contents: read
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-      - uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
         with:
-          go-version: '>=1.23.4'
+          go-version: ">=1.25.3"
 
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@971e284b6050e8a5849b72094c50ab08da042db8 # v6
-        with:
-          version: latest
-      
-      - name: Install dependencies
-        run: go get .
-
-      - name: Build
-        run: go build -v
+      - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9
 
       - name: Test with the Go CLI
         run: go test -v -race ./...
 
-
-  build-push-ar:
+  build-push:
     needs: [test]
-    uses: libops/actions/.github/workflows/build-push.yml@main
+    uses: libops/.github/.github/workflows/build-push.yaml@main
     with:
-      image: "shared/vault-init"
+      docker-registry: "libops"
     permissions:
       contents: read
-      id-token: write
+      packages: write
     secrets: inherit
