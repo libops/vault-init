@@ -164,6 +164,11 @@ func main() {
 		os.Exit(0)
 	}
 
+	retryDelay := time.Second
+	const maxRetryDelay = time.Minute
+	retryAttempts := 0
+	const maxRetryAttempts = 10
+
 	for {
 		select {
 		case <-signalCh:
@@ -173,6 +178,23 @@ func main() {
 		request, err := newVaultRequest(http.MethodHead, vaultAddr+"/v1/sys/health", nil)
 		if err != nil {
 			log.Println(err)
+			if checkInterval < 0 {
+				retryAttempts++
+				if retryAttempts >= maxRetryAttempts {
+					log.Printf("Health check failed after %d attempts; exiting with failure", retryAttempts)
+					os.Exit(1)
+				}
+				log.Printf(
+					"Retrying health check in %s (exponential backoff), attempt %d/%d",
+					retryDelay, retryAttempts, maxRetryAttempts,
+				)
+				time.Sleep(retryDelay)
+				retryDelay *= 2
+				if retryDelay > maxRetryDelay {
+					retryDelay = maxRetryDelay
+				}
+				continue
+			}
 			time.Sleep(checkInterval)
 			continue
 		}
@@ -185,9 +207,50 @@ func main() {
 
 		if err != nil {
 			log.Println(err)
+			if checkInterval < 0 {
+				retryAttempts++
+				if retryAttempts >= maxRetryAttempts {
+					log.Printf("Health check failed after %d attempts; exiting with failure", retryAttempts)
+					os.Exit(1)
+				}
+				log.Printf(
+					"Retrying health check in %s (exponential backoff), attempt %d/%d",
+					retryDelay, retryAttempts, maxRetryAttempts,
+				)
+				time.Sleep(retryDelay)
+				retryDelay *= 2
+				if retryDelay > maxRetryDelay {
+					retryDelay = maxRetryDelay
+				}
+				continue
+			}
 			time.Sleep(checkInterval)
 			continue
 		}
+
+		if checkInterval < 0 && response.StatusCode >= http.StatusInternalServerError && response.StatusCode < 600 {
+			retryAttempts++
+			if retryAttempts >= maxRetryAttempts {
+				log.Printf(
+					"Vault health returned %d and failed after %d attempts; exiting with failure",
+					response.StatusCode, retryAttempts,
+				)
+				os.Exit(1)
+			}
+			log.Printf(
+				"Vault health returned %d. Retrying in %s (exponential backoff), attempt %d/%d",
+				response.StatusCode, retryDelay, retryAttempts, maxRetryAttempts,
+			)
+			time.Sleep(retryDelay)
+			retryDelay *= 2
+			if retryDelay > maxRetryDelay {
+				retryDelay = maxRetryDelay
+			}
+			continue
+		}
+
+		retryDelay = time.Second
+		retryAttempts = 0
 
 		switch response.StatusCode {
 		case 200:
