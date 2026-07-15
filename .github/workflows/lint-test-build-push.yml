@@ -1,30 +1,116 @@
 name: build-push
+
 on:
+  workflow_call:
+    secrets:
+      GCLOUD_OIDC_POOL:
+        required: false
+      GSA:
+        required: false
+  pull_request:
   push:
+    branches:
+      - main
   workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
   test:
-    permissions:
-      contents: read
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-
-      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
         with:
-          go-version: ">=1.25.3"
+          persist-credentials: false
 
-      - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
 
-      - name: Test with the Go CLI
-        run: go test -v -race ./...
+      - name: Verify dependencies
+        run: |
+          go mod download
+          go mod verify
+          go mod tidy -diff
 
-  build-push:
-    needs: [test]
-    uses: libops/.github/.github/workflows/build-push.yaml@main
+      - name: Check GoReleaser configuration
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          distribution: goreleaser
+          version: v2.17.0
+          args: check
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.12.2
+
+      - name: Test
+        run: go test -race ./...
+
+  image-check:
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
+
+      - name: Resolve native platform
+        id: platform
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64) platform=amd64 ;;
+            ARM64) platform=arm64 ;;
+            *) echo "Unsupported runner architecture: $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          echo "name=$platform" >> "$GITHUB_OUTPUT"
+
+      - name: Build native image without credentials
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: .
+          load: true
+          platforms: linux/${{ steps.platform.outputs.name }}
+          provenance: false
+          push: false
+          tags: vault-init:ci-${{ steps.platform.outputs.name }}
+
+      - name: Scan native image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: vault-init:ci-${{ steps.platform.outputs.name }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: test
+    uses: libops/.github/.github/workflows/build-push.yaml@578137212ead4ab4059e95df17fa30e9b7ac4aed
     with:
-      docker-registry: "libops"
+      ref: ${{ github.sha }}
+      expected-main-sha: ${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+      additional-gar-registry: us-docker.pkg.dev/libops-images/public
+      scan: true
+      sign: true
+      certificate-identity: https://github.com/libops/.github/.github/workflows/build-push.yaml@578137212ead4ab4059e95df17fa30e9b7ac4aed
     permissions:
       contents: read
+      id-token: write
       packages: write
-    secrets: inherit
+    secrets:
+      GCLOUD_OIDC_POOL: ${{ secrets.GCLOUD_OIDC_POOL }}
+      GSA: ${{ secrets.GSA }}

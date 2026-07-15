@@ -1,0 +1,5 @@
+.git
+.github
+ci
+main_test.go
+vault-init

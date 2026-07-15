@@ -1,4 +1,5 @@
 name: goreleaser
+
 on:
   workflow_dispatch:
   push:
@@ -6,27 +7,65 @@ on:
       - "*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  goreleaser:
+  test:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: ">=1.25.6"
+          go-version-file: go.mod
+
+      - name: Verify tagged source
+        run: |
+          go mod download
+          go mod verify
+          go mod tidy -diff
+          go test -race ./...
+
+  goreleaser:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           distribution: goreleaser
-          version: latest
+          version: v2.17.0
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-images:
+    if: github.ref_type == 'tag'
+    needs:
+      - test
+      - goreleaser
+    uses: ./.github/workflows/lint-test-build-push.yml
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    secrets:
+      GCLOUD_OIDC_POOL: ${{ secrets.GCLOUD_OIDC_POOL }}
+      GSA: ${{ secrets.GSA }}
