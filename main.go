@@ -60,6 +60,8 @@ const (
 	unsealKeysObjectName  = "unseal-keys.json.enc"
 	rootTokenObjectName   = "root-token.enc" // #nosec G101 -- fixed GCS object name, not a credential value
 	kmsPreflightPlaintext = "vault-init initialization preflight"
+	metadataTokenURL      = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" // #nosec G101 -- metadata endpoint, not a credential value
+	vaultProxyEmailScope  = "https://www.googleapis.com/auth/userinfo.email"
 	secretWriteTimeout    = 2 * time.Minute
 	maxSecretRetryDelay   = time.Minute
 	maxEncryptedBundle    = 256 << 10
@@ -1061,9 +1063,15 @@ func validateVaultAddress(raw string, allowPlaintext bool) (string, error) {
 }
 
 func accessTokenFromMetadata() (string, error) {
-	const metadataTokenURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" // #nosec G101 -- metadata endpoint, not a credential value
+	tokenURL, err := url.Parse(metadataTokenURL)
+	if err != nil {
+		return "", fmt.Errorf("parse metadata token URL: %w", err)
+	}
+	query := tokenURL.Query()
+	query.Set("scopes", vaultProxyEmailScope)
+	tokenURL.RawQuery = query.Encode()
 
-	request, err := http.NewRequest(http.MethodGet, metadataTokenURL, nil)
+	request, err := http.NewRequest(http.MethodGet, tokenURL.String(), nil)
 	if err != nil {
 		return "", err
 	}

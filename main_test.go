@@ -301,6 +301,46 @@ func TestMetadataClientDoesNotUseProxyOrRedirects(t *testing.T) {
 	}
 }
 
+func TestAccessTokenFromMetadataRequestsVerifiedEmailScope(t *testing.T) {
+	originalMetadataClient := metadataClient
+	t.Cleanup(func() {
+		metadataClient = originalMetadataClient
+	})
+
+	metadataClient = &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodGet {
+				t.Fatalf("metadata method = %q, want GET", request.Method)
+			}
+			if request.URL.Scheme != "http" || request.URL.Host != "metadata.google.internal" {
+				t.Fatalf("metadata origin = %q, want http://metadata.google.internal", request.URL.Scheme+"://"+request.URL.Host)
+			}
+			if request.URL.Path != "/computeMetadata/v1/instance/service-accounts/default/token" {
+				t.Fatalf("metadata path = %q", request.URL.Path)
+			}
+			if got := request.URL.Query()["scopes"]; !reflect.DeepEqual(got, []string{vaultProxyEmailScope}) {
+				t.Fatalf("metadata scopes = %v, want only %q", got, vaultProxyEmailScope)
+			}
+			if flavor := request.Header.Get("Metadata-Flavor"); flavor != "Google" {
+				t.Fatalf("Metadata-Flavor = %q, want Google", flavor)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"access_token":"scoped-token"}`)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	token, err := accessTokenFromMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "scoped-token" {
+		t.Fatalf("access token = %q, want scoped-token", token)
+	}
+}
+
 func TestVaultHealthRequestDoesNotMintOrSendAdminToken(t *testing.T) {
 	originalMetadataClient := metadataClient
 	t.Cleanup(func() {

@@ -92,7 +92,10 @@ The `vault-init` service supports the following environment variables for config
   because the service sends its Google access token in the `X-Admin-Token`
   header. The address must not contain credentials, a path, query, or fragment.
   Metadata token retrieval bypasses environment-configured HTTP proxies and does
-  not follow redirects.
+  not follow redirects. The token requests only the
+  `https://www.googleapis.com/auth/userinfo.email` scope required for Vault
+  Proxy to verify the service-account email; KMS and GCS use separate
+  application-default credentials.
 
 - `VAULT_ALLOW_PLAINTEXT` (false) - Permit an `http://` Vault address. This is an
   explicit development-only escape hatch because it exposes the Google access
