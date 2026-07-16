@@ -32,8 +32,13 @@ func TestPublicationUsesSharedGHCRAndGARContract(t *testing.T) {
 	workflow := readFile(t, ".github", "workflows", "lint-test-build-push.yml")
 	for _, required := range []string{
 		"libops/.github/.github/workflows/build-push.yaml@" + sharedWorkflowSHA,
+		"libops/.github/.github/workflows/pr-status.yaml@" + sharedWorkflowSHA,
+		"\n  build-push:\n",
 		"image-check:",
 		"if: github.event_name == 'pull_request'",
+		"if: always() && github.event_name == 'pull_request'",
+		"needs-json: ${{ toJSON(needs) }}",
+		"permissions: {}",
 		"ubuntu-24.04-arm",
 		"aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25",
 		"severity: HIGH,CRITICAL",
