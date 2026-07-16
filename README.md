@@ -4,25 +4,75 @@ The `vault-init` service automates the process of [initializing](https://www.vau
 
 After `vault-init` initializes a Vault server it stores master keys and root tokens, encrypted using [Google Cloud KMS](https://cloud.google.com/kms), to a user defined [Google Cloud Storage](https://cloud.google.com/storage) bucket.
 
+Vault returns its initial recovery material only once. Before sending the
+initialization request, this service verifies that neither destination object
+already exists, that KMS can encrypt and decrypt a round-trip probe, and that
+the workload can commit and read back a unique non-secret, create-only GCS
+marker. The retained `vault-init-preflight/` marker is intentional because the
+runtime has no object-delete permission. A graceful shutdown received before
+the initialization request is sent aborts safely and leaves a one-shot job
+retryable. Once the request is committed, the service ignores graceful
+shutdown, retains a successful response in memory, and retries KMS and GCS with
+bounded exponential backoff. GCS writes use a create-only precondition. A run
+is complete only after each write is confirmed committed: either the writer
+`Close` succeeds or a byte-identical create-only object is read back after an
+ambiguous close result. The
+complete encrypted initialization response is stored before the convenience
+root-token object, so a partial two-object write still preserves all recovery
+material. If the successful response is malformed or fails partway through a
+read, the bytes received are encrypted and stored before the process reports
+failure, and the convenience object is not created. Operators must avoid
+forcibly terminating the initializer between
+Vault accepting `/v1/sys/init` and the "Initialization complete" log entry.
+
+Every run that finds Vault already initialized verifies that both encrypted
+objects exist and are non-empty before exiting successfully. This makes a
+Cloud Run retry idempotent when the first task stored the response but lost its
+final client response. If only `root-token.enc` is missing, the retry decrypts
+the complete response and recreates that convenience object with the same
+create-only protection. If `unseal-keys.json.enc` is missing, the one-time Vault
+response cannot be reconstructed: the process exits nonzero and repeated job
+attempts will continue to fail rather than silently claiming success. The
+default Cloud Run Job policy [retries a failed task three
+times](https://cloud.google.com/run/docs/configuring/max-retries). Those retries
+can bridge transient GCS errors, but they cannot repair a missing recovery
+bundle. Configure a task timeout long enough for the post-initialization retry
+loop because forced termination or task timeout can still destroy the only
+in-memory copy.
+
 ## Usage
 
 The `vault-init` service is designed to be run alongside a Vault server and
 communicate over local host.
 
-You can download the code and compile the binary with Go. Alternatively, a
-Docker container is available via the Docker Hub:
+You can download the code and compile the binary with Go. Release images are
+published as one signed multi-platform manifest to both GHCR and the public
+LibOps Google Artifact Registry repository:
 
 ```text
-$ docker pull jcorall/vault-init
+docker pull ghcr.io/libops/vault-init:1.0.2
+docker pull us-docker.pkg.dev/libops-images/public/vault-init:1.0.2
 ```
+
+Both references are assembled from the same scanned amd64 and arm64 image
+digests. Production Terraform must resolve the reviewed version tag and deploy
+an immutable `@sha256:...` reference. GHCR is the general distribution source;
+the GAR copy exists for Cloud Run.
+
+Pull requests test the Go code and build path without publisher credentials.
+Main and release publication use the SHA-pinned LibOps shared workflow, the
+repository-scoped `github@libops-images` workload identity, and explicit GitHub
+secrets. The workflow scans each native image before any stable tag is written,
+checks GHCR/GAR manifest parity, then keylessly signs and verifies both final
+manifests. It does not publish build-provenance attestations.
 
 To use this as part of a Kubernetes Vault Deployment:
 
 ```yaml
 containers:
 - name: vault-init
-  image: registry.hub.docker.com/jcorall/vault-init:0.3.0
-  imagePullPolicy: Always
+  image: ghcr.io/libops/vault-init@sha256:REVIEWED_MANIFEST_DIGEST
+  imagePullPolicy: IfNotPresent
   env:
   - name: GCS_BUCKET_NAME
     value: my-gcs-bucket
@@ -35,7 +85,27 @@ containers:
 The `vault-init` service supports the following environment variables for configuration:
 
 - `CHECK_INTERVAL` ("10s") - The time duration between Vault health checks. Set
-  this to a negative number to unseal once and exit.
+  this to zero or a negative number to check, initialize or unseal once and
+  exit. One-shot failures return a nonzero status.
+
+- `VAULT_ADDR` ("https://127.0.0.1:8200") - Vault API address. HTTPS is required
+  because the service sends its Google access token in the `X-Admin-Token`
+  header. The address must not contain credentials, a path, query, or fragment.
+  Metadata token retrieval bypasses environment-configured HTTP proxies and does
+  not follow redirects. The token requests only the
+  `https://www.googleapis.com/auth/userinfo.email` scope required for Vault
+  Proxy to verify the service-account email; KMS and GCS use separate
+  application-default credentials.
+
+- `VAULT_ALLOW_PLAINTEXT` (false) - Permit an `http://` Vault address. This is an
+  explicit development-only escape hatch because it exposes the Google access
+  token and Vault initialization traffic to interception.
+
+- `VAULT_CLIENT_TIMEOUT` ("60s") - Timeout for Vault API requests. An overly
+  short timeout can make the result of the one-time initialization request
+  ambiguous. Redirects are never followed because every Vault request carries
+  the privileged Google access token and initialization redirects would also
+  make commit state ambiguous.
 
 - `GCS_BUCKET_NAME` - The Google Cloud Storage Bucket where the Vault master key
   and root token is stored.
@@ -60,7 +130,7 @@ The `vault-init` service supports the following environment variables for config
   Only applies to Vault 1.0 native auto-unseal.
 
 - `VAULT_SKIP_VERIFY` (false) - Disable TLS validation when connecting. Setting
-  to true is highly discouraged.
+  to true is highly discouraged. TLS 1.2 or newer is required by default.
 
 - `VAULT_CACERT` ("") - Path on disk to the CA _file_ to use for verifying TLS
   connections to Vault.
@@ -96,8 +166,17 @@ Additionally, the service account must have the following minimum role(s):
 
 ```text
 roles/cloudkms.cryptoKeyEncrypterDecrypter
-roles/storage.objectAdmin OR roles/storage.legacyBucketWriter
+roles/storage.objectCreator
+roles/storage.objectViewer
 ```
+
+Object read access is intentional: it lets the initializer refuse to overwrite
+older recovery material and verify an idempotent retry when a successful GCS
+commit loses its client response. Object Creator plus Object Viewer provides
+the required create/read permissions without granting this workload delete or
+overwrite access. Use a dedicated bucket for each Vault deployment and protect
+it with retention, versioning, restricted administration, and an independently
+tested recovery procedure.
 
 For more information on service accounts, please see the
 [Google Cloud Service Accounts documentation][service-accounts].
