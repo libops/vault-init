@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-const sharedWorkflowSHA = "578137212ead4ab4059e95df17fa30e9b7ac4aed"
+const sharedWorkflowSHA = "8e27d95846671a9e319f1900e86a488a1d4f39b3"
 
 func repositoryRoot(t *testing.T) string {
 	t.Helper()
