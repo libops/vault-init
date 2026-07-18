@@ -8,7 +8,10 @@ import (
 	"testing"
 )
 
-const sharedWorkflowSHA = "d5a29840172a53729c5999832534de65b7ba9587"
+const (
+	sharedPublisherSHA = "8e27d95846671a9e319f1900e86a488a1d4f39b3"
+	sharedWorkflowSHA  = "d5a29840172a53729c5999832534de65b7ba9587"
+)
 
 func repositoryRoot(t *testing.T) string {
 	t.Helper()
@@ -31,7 +34,7 @@ func readFile(t *testing.T, path ...string) string {
 func TestPublicationUsesSharedGHCRAndGARContract(t *testing.T) {
 	workflow := readFile(t, ".github", "workflows", "lint-test-build-push.yml")
 	for _, required := range []string{
-		"libops/.github/.github/workflows/build-push.yaml@" + sharedWorkflowSHA,
+		"libops/.github/.github/workflows/build-push.yaml@" + sharedPublisherSHA,
 		"libops/.github/.github/workflows/pr-status.yaml@" + sharedWorkflowSHA,
 		"\n  build-push:\n",
 		"image-check:",
@@ -48,7 +51,7 @@ func TestPublicationUsesSharedGHCRAndGARContract(t *testing.T) {
 		"expected-main-sha:",
 		"scan: true",
 		"sign: true",
-		"certificate-identity: https://github.com/libops/.github/.github/workflows/build-push.yaml@" + sharedWorkflowSHA,
+		"certificate-identity: https://github.com/libops/.github/.github/workflows/build-push.yaml@" + sharedPublisherSHA,
 		"GCLOUD_OIDC_POOL: ${{ secrets.GCLOUD_OIDC_POOL }}",
 		"GSA: ${{ secrets.GSA }}",
 	} {
