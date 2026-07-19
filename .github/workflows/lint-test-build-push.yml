@@ -109,14 +109,14 @@ jobs:
   publish:
     if: github.event_name != 'pull_request'
     needs: test
-    uses: libops/.github/.github/workflows/build-push.yaml@8e27d95846671a9e319f1900e86a488a1d4f39b3
+    uses: libops/.github/.github/workflows/build-push.yaml@d5a29840172a53729c5999832534de65b7ba9587
     with:
       ref: ${{ github.sha }}
       expected-main-sha: ${{ github.ref == 'refs/heads/main' && github.sha || '' }}
       additional-gar-registry: us-docker.pkg.dev/libops-images/public
       scan: true
       sign: true
-      certificate-identity: https://github.com/libops/.github/.github/workflows/build-push.yaml@8e27d95846671a9e319f1900e86a488a1d4f39b3
+      certificate-identity: https://github.com/libops/.github/.github/workflows/build-push.yaml@d5a29840172a53729c5999832534de65b7ba9587
     permissions:
       contents: read
       id-token: write

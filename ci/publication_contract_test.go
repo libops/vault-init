@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	sharedPublisherSHA = "8e27d95846671a9e319f1900e86a488a1d4f39b3"
+	sharedPublisherSHA = "d5a29840172a53729c5999832534de65b7ba9587"
 	sharedWorkflowSHA  = "d5a29840172a53729c5999832534de65b7ba9587"
 )
 
