@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -43,6 +44,7 @@ var (
 	vaultStoredShares      int
 	vaultRecoveryShares    int
 	vaultRecoveryThreshold int
+	vaultRecoveryPGPKeys   []string
 
 	kmsService *cloudkms.Service
 	kmsKeyId   string
@@ -57,14 +59,15 @@ var (
 )
 
 const (
-	unsealKeysObjectName  = "unseal-keys.json.enc"
-	rootTokenObjectName   = "root-token.enc" // #nosec G101 -- fixed GCS object name, not a credential value
-	kmsPreflightPlaintext = "vault-init initialization preflight"
-	metadataTokenURL      = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" // #nosec G101 -- metadata endpoint, not a credential value
-	vaultProxyEmailScope  = "https://www.googleapis.com/auth/userinfo.email"
-	secretWriteTimeout    = 2 * time.Minute
-	maxSecretRetryDelay   = time.Minute
-	maxEncryptedBundle    = 256 << 10
+	unsealKeysObjectName        = "unseal-keys.json.enc"
+	rootTokenObjectName         = "root-token.enc" // #nosec G101 -- legacy fixed object name, not a credential value
+	bootstrapCompleteObjectName = "bootstrap-complete.json"
+	kmsPreflightPlaintext       = "vault-init initialization preflight"
+	metadataTokenURL            = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" // #nosec G101 -- metadata endpoint, not a credential value
+	vaultProxyEmailScope        = "https://www.googleapis.com/auth/userinfo.email"
+	secretWriteTimeout          = 2 * time.Minute
+	maxSecretRetryDelay         = time.Minute
+	maxEncryptedBundle          = 256 << 10
 )
 
 type secretEncrypter func(context.Context, []byte) ([]byte, error)
@@ -77,11 +80,12 @@ type storageRoundTripTester func(context.Context) error
 
 // InitRequest holds a Vault init request.
 type InitRequest struct {
-	SecretShares      int `json:"secret_shares"`
-	SecretThreshold   int `json:"secret_threshold"`
-	StoredShares      int `json:"stored_shares"`
-	RecoveryShares    int `json:"recovery_shares"`
-	RecoveryThreshold int `json:"recovery_threshold"`
+	SecretShares      int      `json:"secret_shares"`
+	SecretThreshold   int      `json:"secret_threshold"`
+	StoredShares      int      `json:"stored_shares"`
+	RecoveryShares    int      `json:"recovery_shares"`
+	RecoveryThreshold int      `json:"recovery_threshold"`
+	RecoveryPGPKeys   []string `json:"recovery_pgp_keys,omitempty"`
 }
 
 // InitResponse holds a Vault init response.
@@ -91,6 +95,20 @@ type InitResponse struct {
 	RecoveryKeys       []string `json:"recovery_keys"`
 	RecoveryKeysBase64 []string `json:"recovery_keys_base64"`
 	RootToken          string   `json:"root_token"`
+}
+
+type bootstrapCompletion struct {
+	SchemaVersion      int      `json:"schema_version"`
+	AuditPath          string   `json:"audit_path"`
+	RootTokenRevoked   bool     `json:"root_token_revoked"`
+	RecoveryShares     int      `json:"recovery_shares"`
+	RecoveryThreshold  int      `json:"recovery_threshold"`
+	CustodianKeySHA256 []string `json:"custodian_key_sha256"`
+}
+
+type auditDevice struct {
+	Type    string            `json:"type"`
+	Options map[string]string `json:"options"`
 }
 
 // UnsealRequest holds a Vault unseal request.
@@ -134,8 +152,12 @@ func main() {
 
 	if vaultAutoUnseal {
 		vaultStoredShares = intFromEnv("VAULT_STORED_SHARES", 1)
-		vaultRecoveryShares = intFromEnv("VAULT_RECOVERY_SHARES", 1)
-		vaultRecoveryThreshold = intFromEnv("VAULT_RECOVERY_THRESHOLD", 1)
+		vaultRecoveryShares = intFromEnv("VAULT_RECOVERY_SHARES", 5)
+		vaultRecoveryThreshold = intFromEnv("VAULT_RECOVERY_THRESHOLD", 3)
+		vaultRecoveryPGPKeys, err = recoveryPGPKeysFromEnv("VAULT_RECOVERY_PGP_KEYS", vaultRecoveryShares, vaultRecoveryThreshold)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	vaultCaCert := stringFromEnv("VAULT_CACERT", "")
@@ -363,6 +385,7 @@ func initialize(shutdown <-chan os.Signal) error {
 		StoredShares:      vaultStoredShares,
 		RecoveryShares:    vaultRecoveryShares,
 		RecoveryThreshold: vaultRecoveryThreshold,
+		RecoveryPGPKeys:   vaultRecoveryPGPKeys,
 	}
 
 	// allow optional secret shares/threshold to support GCP KMS on newer version of Vault
@@ -416,51 +439,46 @@ func initialize(shutdown <-chan os.Signal) error {
 
 	initRequestResponseBody, err := io.ReadAll(response.Body)
 	if err != nil {
-		if len(initRequestResponseBody) > 0 {
-			persistenceErr := retryInitializationPersistence(
-				initRequestResponseBody,
-				"",
-				encryptSecretWithKMS,
-				storeEncryptedSecretOnce,
-				time.Sleep,
-			)
-			return fmt.Errorf("read initialization response: %w (partial encrypted response preserved: %v)", err, persistenceErr)
-		}
-		return fmt.Errorf("read initialization response: %w", err)
+		return fmt.Errorf("read initialization response: %w; refusing to persist an unvalidated response that may contain a live root token", err)
 	}
 
 	var initResponse InitResponse
 
 	if err := json.Unmarshal(initRequestResponseBody, &initResponse); err != nil {
-		// Preserve every byte returned by the one-time endpoint even when its
-		// shape is unexpected. Passing an empty root token makes the persistence
-		// routine stop after the complete encrypted response is durable.
-		persistenceErr := retryInitializationPersistence(
-			initRequestResponseBody,
-			"",
-			encryptSecretWithKMS,
-			storeEncryptedSecretOnce,
-			time.Sleep,
-		)
-		return fmt.Errorf("decode initialization response: %w (%v)", err, persistenceErr)
+		return fmt.Errorf("decode initialization response: %w; refusing to persist an unvalidated response that may contain a live root token", err)
+	}
+	if initResponse.RootToken == "" {
+		return fmt.Errorf("initialization response did not contain a root token")
+	}
+	if len(initResponse.RecoveryKeys) == 0 && len(initResponse.RecoveryKeysBase64) == 0 &&
+		len(initResponse.Keys) == 0 && len(initResponse.KeysBase64) == 0 {
+		return fmt.Errorf("initialization response did not contain recovery or unseal keys")
 	}
 
 	// Vault returns its recovery material exactly once. Once the server accepts
-	// the init request, do not honor shutdown or return to the health loop until
-	// that material is durably encrypted and stored. Retrying in this process is
-	// the only safe response to a transient KMS or GCS failure.
-	log.Println("Encrypting and durably storing unseal keys and the root token...")
-	if err := retryInitializationPersistence(
-		initRequestResponseBody,
-		initResponse.RootToken,
+	// the init request, first persist a root-token-free recovery bundle. Enable
+	// the audit device next so revocation itself is audited, revoke and verify the
+	// initial root token, and only then publish the non-secret completion marker.
+	// A crash after the recovery bundle is durable but before completion fails
+	// closed for a quorum-based operator repair; it never leaves a root token in
+	// GCS for an automated retry.
+	log.Println("Encrypting and durably storing root-token-free recovery material...")
+	if err := retryRecoveryPersistence(
+		initResponse,
 		encryptSecretWithKMS,
 		storeEncryptedSecretOnce,
 		time.Sleep,
 	); err != nil {
 		return err
 	}
+	if err := enableAuditAndRevokeInitialRoot(initResponse.RootToken); err != nil {
+		return fmt.Errorf("secure bootstrap incomplete after recovery material became durable: %w; use the recovery-key quorum to inspect audit state and generate a short-lived repair token", err)
+	}
+	if err := persistBootstrapCompletion(storeEncryptedSecretOnce, time.Sleep); err != nil {
+		return err
+	}
 
-	log.Println("Initialization complete.")
+	log.Println("Initialization complete; audit is enabled and the initial root token is revoked.")
 	return nil
 }
 
@@ -551,21 +569,25 @@ func verifyStorageRoundTrip(
 	return nil
 }
 
-func retryInitializationPersistence(
-	initResponse []byte,
-	rootToken string,
+func retryRecoveryPersistence(
+	initResponse InitResponse,
 	encrypt secretEncrypter,
 	store encryptedSecretStore,
 	wait func(time.Duration),
 ) error {
 	retryDelay := time.Second
 
-	// Protect and store the complete response before doing any work on the
-	// redundant root-token object. This minimizes the interval in which a forced
-	// task termination could destroy Vault's one-time recovery response.
+	// Never serialize the initial root token into the recovery object. Recovery
+	// keys are the durable break-glass mechanism and can generate a short-lived
+	// root token with the configured quorum when an operator explicitly needs it.
+	initResponse.RootToken = ""
+	recoveryResponse, err := json.Marshal(initResponse)
+	if err != nil {
+		return fmt.Errorf("marshal root-token-free recovery response: %w", err)
+	}
 	protectedResponse := retrySecretEncryption(
-		initResponse,
-		"initialization response",
+		recoveryResponse,
+		"recovery response",
 		encrypt,
 		wait,
 		&retryDelay,
@@ -573,35 +595,169 @@ func retryInitializationPersistence(
 	retrySecretStore(
 		unsealKeysObjectName,
 		protectedResponse,
-		"initialization response",
+		"recovery response",
 		store,
 		wait,
 		&retryDelay,
 	)
-	log.Printf("Unseal keys written to gs://%s/%s", gcsBucketName, unsealKeysObjectName)
+	log.Printf("Root-token-free recovery material written to gs://%s/%s", gcsBucketName, unsealKeysObjectName)
+	return nil
+}
 
+func persistBootstrapCompletion(store encryptedSecretStore, wait func(time.Duration)) error {
+	custodianDigests, err := recoveryPGPKeyDigests(vaultRecoveryPGPKeys)
+	if err != nil {
+		return fmt.Errorf("derive recovery custodian fingerprints: %w", err)
+	}
+	record, err := json.Marshal(bootstrapCompletion{
+		SchemaVersion:      1,
+		AuditPath:          "cloudrun",
+		RootTokenRevoked:   true,
+		RecoveryShares:     vaultRecoveryShares,
+		RecoveryThreshold:  vaultRecoveryThreshold,
+		CustodianKeySHA256: custodianDigests,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal bootstrap completion: %w", err)
+	}
+	retryDelay := time.Second
+	retrySecretStore(
+		bootstrapCompleteObjectName,
+		record,
+		"non-secret bootstrap completion",
+		store,
+		wait,
+		&retryDelay,
+	)
+	log.Printf("Secure bootstrap completion written to gs://%s/%s", gcsBucketName, bootstrapCompleteObjectName)
+	return nil
+}
+
+func enableAuditAndRevokeInitialRoot(rootToken string) error {
 	if rootToken == "" {
-		return fmt.Errorf("initialization response did not contain a root token; the complete encrypted response is durable at gs://%s/%s", gcsBucketName, unsealKeysObjectName)
+		return fmt.Errorf("initial root token is empty")
+	}
+	if err := ensureStdoutAuditDevice(rootToken); err != nil {
+		return err
+	}
+	if err := revokeInitialRootToken(rootToken); err != nil {
+		return err
+	}
+	return verifyInitialRootTokenRevoked(rootToken)
+}
+
+func ensureStdoutAuditDevice(rootToken string) error {
+	devices, err := readAuditDevices(rootToken)
+	if err != nil {
+		return fmt.Errorf("read audit devices: %w", err)
+	}
+	if device, ok := devices["cloudrun/"]; ok {
+		return validateStdoutAuditDevice(device)
 	}
 
-	protectedRootToken := retrySecretEncryption(
-		[]byte(rootToken),
-		"root token",
-		encrypt,
-		wait,
-		&retryDelay,
-	)
-	retrySecretStore(
-		rootTokenObjectName,
-		protectedRootToken,
-		"root token",
-		store,
-		wait,
-		&retryDelay,
-	)
+	payload, err := json.Marshal(map[string]any{
+		"type":        "file",
+		"description": "Cloud Run stdout audit stream",
+		"options": map[string]string{
+			"file_path":            "stdout",
+			"format":               "json",
+			"hmac_accessor":        "true",
+			"log_raw":              "false",
+			"elide_list_responses": "true",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal audit configuration: %w", err)
+	}
+	status, _, err := doRootVaultRequest(http.MethodPost, "/v1/sys/audit/cloudrun", payload, rootToken)
+	if err != nil {
+		return fmt.Errorf("enable stdout audit device: %w", err)
+	}
+	if status != http.StatusNoContent {
+		return fmt.Errorf("enable stdout audit device: unexpected status %d", status)
+	}
+	devices, err = readAuditDevices(rootToken)
+	if err != nil {
+		return fmt.Errorf("verify stdout audit device: %w", err)
+	}
+	device, ok := devices["cloudrun/"]
+	if !ok {
+		return fmt.Errorf("verify stdout audit device: cloudrun/ is absent")
+	}
+	return validateStdoutAuditDevice(device)
+}
 
-	log.Printf("Root token written to gs://%s/%s", gcsBucketName, rootTokenObjectName)
+func readAuditDevices(rootToken string) (map[string]auditDevice, error) {
+	status, body, err := doRootVaultRequest(http.MethodGet, "/v1/sys/audit", nil, rootToken)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status %d", status)
+	}
+	var devices map[string]auditDevice
+	if err := json.Unmarshal(body, &devices); err != nil {
+		return nil, fmt.Errorf("decode audit devices: %w", err)
+	}
+	return devices, nil
+}
+
+func validateStdoutAuditDevice(device auditDevice) error {
+	if device.Type != "file" || device.Options["file_path"] != "stdout" ||
+		device.Options["log_raw"] == "true" {
+		return fmt.Errorf("cloudrun/ audit device must be file output to stdout with raw secret logging disabled")
+	}
 	return nil
+}
+
+func revokeInitialRootToken(rootToken string) error {
+	status, _, err := doRootVaultRequest(http.MethodPost, "/v1/auth/token/revoke-self", nil, rootToken)
+	if err != nil {
+		return fmt.Errorf("revoke initial root token: %w", err)
+	}
+	if status != http.StatusNoContent {
+		return fmt.Errorf("revoke initial root token: unexpected status %d", status)
+	}
+	return nil
+}
+
+func verifyInitialRootTokenRevoked(rootToken string) error {
+	status, _, err := doRootVaultRequest(http.MethodGet, "/v1/auth/token/lookup-self", nil, rootToken)
+	if err != nil {
+		return fmt.Errorf("verify initial root token revocation: %w", err)
+	}
+	if status != http.StatusForbidden {
+		return fmt.Errorf("verify initial root token revocation: got status %d, want 403", status)
+	}
+	return nil
+}
+
+func doRootVaultRequest(method, requestPath string, payload []byte, rootToken string) (int, []byte, error) {
+	var body io.Reader
+	if payload != nil {
+		body = bytes.NewReader(payload)
+	}
+	request, err := newVaultRequest(method, vaultAddr+requestPath, body)
+	if err != nil {
+		return 0, nil, err
+	}
+	request.Header.Set("X-Vault-Token", rootToken)
+	if payload != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxEncryptedBundle+1))
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(responseBody) > maxEncryptedBundle {
+		return 0, nil, fmt.Errorf("Vault response exceeds %d bytes", maxEncryptedBundle)
+	}
+	return response.StatusCode, responseBody, nil
 }
 
 func retrySecretEncryption(
@@ -754,7 +910,7 @@ func statEncryptedSecret(ctx context.Context, name string) (int64, error) {
 }
 
 func ensureInitializationTargetsEmpty(ctx context.Context, stat encryptedSecretStat) error {
-	for _, name := range []string{unsealKeysObjectName, rootTokenObjectName} {
+	for _, name := range []string{unsealKeysObjectName, bootstrapCompleteObjectName, rootTokenObjectName} {
 		_, err := stat(ctx, name)
 		if errors.Is(err, storage.ErrObjectNotExist) {
 			continue
@@ -770,61 +926,63 @@ func ensureInitializationTargetsEmpty(ctx context.Context, stat encryptedSecretS
 func verifyDurableInitialization() error {
 	ctx, cancel := context.WithTimeout(context.Background(), secretWriteTimeout)
 	defer cancel()
-
-	initialErr := verifyStoredRecoveryMaterial(ctx, statEncryptedSecret)
-	if initialErr == nil {
-		return nil
+	if err := verifyStoredRecoveryMaterial(ctx, statEncryptedSecret); err != nil {
+		return err
 	}
-
-	bundleSize, bundleErr := statEncryptedSecret(ctx, unsealKeysObjectName)
-	_, rootErr := statEncryptedSecret(ctx, rootTokenObjectName)
-	if bundleErr != nil || bundleSize <= 0 || !errors.Is(rootErr, storage.ErrObjectNotExist) {
-		return initialErr
+	if err := verifyRecoveryBundleContents(ctx, readEncryptedSecret, decryptSecretWithKMS); err != nil {
+		return err
 	}
-
-	if err := restoreRootTokenObject(
-		ctx,
-		readEncryptedSecret,
-		decryptSecretWithKMS,
-		encryptSecretWithKMS,
-		storeEncryptedSecretOnce,
-	); err != nil {
-		return fmt.Errorf("%w; restore missing root-token object from durable response: %v", initialErr, err)
-	}
-	log.Printf("Restored root token to gs://%s/%s from the durable initialization response", gcsBucketName, rootTokenObjectName)
-	return verifyStoredRecoveryMaterial(ctx, statEncryptedSecret)
+	return verifyBootstrapCompletion(ctx, readEncryptedSecret)
 }
 
-func restoreRootTokenObject(
-	ctx context.Context,
-	read encryptedSecretReader,
-	decrypt secretDecrypter,
-	encrypt secretEncrypter,
-	store encryptedSecretStore,
-) error {
+func verifyRecoveryBundleContents(ctx context.Context, read encryptedSecretReader, decrypt secretDecrypter) error {
 	protectedResponse, err := read(ctx, unsealKeysObjectName)
 	if err != nil {
-		return fmt.Errorf("read encrypted initialization response: %w", err)
+		return fmt.Errorf("read encrypted recovery response: %w", err)
 	}
-	initResponseJSON, err := decrypt(ctx, protectedResponse)
+	recoveryJSON, err := decrypt(ctx, protectedResponse)
 	if err != nil {
-		return fmt.Errorf("decrypt initialization response: %w", err)
+		return fmt.Errorf("decrypt recovery response: %w", err)
 	}
+	var recovery InitResponse
+	if err := json.Unmarshal(recoveryJSON, &recovery); err != nil {
+		return fmt.Errorf("decode recovery response: %w", err)
+	}
+	if recovery.RootToken != "" {
+		return fmt.Errorf("encrypted recovery response retains an initial root token; migrate it to the root-token-free schema under dual control")
+	}
+	if len(recovery.RecoveryKeys) == 0 && len(recovery.RecoveryKeysBase64) == 0 &&
+		len(recovery.Keys) == 0 && len(recovery.KeysBase64) == 0 {
+		return fmt.Errorf("encrypted recovery response contains no recovery or unseal keys")
+	}
+	return nil
+}
 
-	var initResponse InitResponse
-	if err := json.Unmarshal(initResponseJSON, &initResponse); err != nil {
-		return fmt.Errorf("decode initialization response: %w", err)
-	}
-	if initResponse.RootToken == "" {
-		return fmt.Errorf("initialization response did not contain a root token")
-	}
-
-	protectedRootToken, err := encrypt(ctx, []byte(initResponse.RootToken))
+func verifyBootstrapCompletion(ctx context.Context, read encryptedSecretReader) error {
+	recordJSON, err := read(ctx, bootstrapCompleteObjectName)
 	if err != nil {
-		return fmt.Errorf("encrypt root token: %w", err)
+		return fmt.Errorf("read secure bootstrap completion: %w", err)
 	}
-	if err := store(ctx, rootTokenObjectName, protectedRootToken); err != nil {
-		return fmt.Errorf("store encrypted root token: %w", err)
+	var record bootstrapCompletion
+	if err := json.Unmarshal(recordJSON, &record); err != nil {
+		return fmt.Errorf("decode secure bootstrap completion: %w", err)
+	}
+	if record.SchemaVersion != 1 || record.AuditPath != "cloudrun" || !record.RootTokenRevoked ||
+		record.RecoveryShares < 3 || record.RecoveryThreshold < 2 ||
+		record.RecoveryThreshold > record.RecoveryShares ||
+		len(record.CustodianKeySHA256) != record.RecoveryShares {
+		return fmt.Errorf("secure bootstrap completion does not prove the required audit device, root-token revocation, and independent recovery quorum")
+	}
+	seen := make(map[string]struct{}, len(record.CustodianKeySHA256))
+	for _, fingerprint := range record.CustodianKeySHA256 {
+		decoded, decodeErr := hex.DecodeString(fingerprint)
+		if decodeErr != nil || len(decoded) != sha256.Size || fingerprint != strings.ToLower(fingerprint) {
+			return fmt.Errorf("secure bootstrap completion contains an invalid custodian key fingerprint")
+		}
+		if _, duplicate := seen[fingerprint]; duplicate {
+			return fmt.Errorf("secure bootstrap completion does not prove independent recovery custodians")
+		}
+		seen[fingerprint] = struct{}{}
 	}
 	return nil
 }
@@ -852,7 +1010,7 @@ func readEncryptedSecret(ctx context.Context, name string) ([]byte, error) {
 }
 
 func verifyStoredRecoveryMaterial(ctx context.Context, stat encryptedSecretStat) error {
-	for _, name := range []string{unsealKeysObjectName, rootTokenObjectName} {
+	for _, name := range []string{unsealKeysObjectName, bootstrapCompleteObjectName} {
 		size, err := stat(ctx, name)
 		if errors.Is(err, storage.ErrObjectNotExist) {
 			return fmt.Errorf("gs://%s/%s is missing", gcsBucketName, name)
@@ -863,6 +1021,11 @@ func verifyStoredRecoveryMaterial(ctx context.Context, stat encryptedSecretStat)
 		if size <= 0 {
 			return fmt.Errorf("gs://%s/%s is empty", gcsBucketName, name)
 		}
+	}
+	if size, err := stat(ctx, rootTokenObjectName); err == nil {
+		return fmt.Errorf("legacy gs://%s/%s still exists (%d bytes); revoke the retained token, replace the recovery bundle with a root-token-free copy, and remove the legacy object under dual control", gcsBucketName, rootTokenObjectName, size)
+	} else if !errors.Is(err, storage.ErrObjectNotExist) {
+		return fmt.Errorf("inspect legacy gs://%s/%s: %w", gcsBucketName, rootTokenObjectName, err)
 	}
 	return nil
 }
@@ -1000,7 +1163,7 @@ func newVaultRequest(method, url string, body io.Reader) (*http.Request, error) 
 	}
 
 	request.Header.Set("Accept", "application/json")
-	if method == http.MethodPut {
+	if body != nil && (method == http.MethodPut || method == http.MethodPost) {
 		request.Header.Set("Content-Type", "application/json")
 	}
 
@@ -1110,6 +1273,57 @@ func newMetadataHTTPClient() *http.Client {
 			DisableKeepAlives: true,
 		},
 	}
+}
+
+func recoveryPGPKeysFromEnv(env string, shares, threshold int) ([]string, error) {
+	if shares < 3 || threshold < 2 || threshold > shares {
+		return nil, fmt.Errorf("recovery custody requires at least three shares, a threshold of at least two, and threshold no greater than shares")
+	}
+	raw := os.Getenv(env)
+	if raw == "" {
+		return nil, fmt.Errorf("%s must contain a JSON array of %d independent custodian PGP public keys", env, shares)
+	}
+	var keys []string
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	if err := decoder.Decode(&keys); err != nil {
+		return nil, fmt.Errorf("parse %s as a JSON string array: %w", env, err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%s must contain one JSON value", env)
+	}
+	if len(keys) != shares {
+		return nil, fmt.Errorf("%s must contain exactly %d keys, got %d", env, shares, len(keys))
+	}
+	seen := make(map[[sha256.Size]byte]struct{}, len(keys))
+	for i, key := range keys {
+		decoded, err := base64.StdEncoding.Strict().DecodeString(key)
+		if err != nil {
+			return nil, fmt.Errorf("%s key %d is not strict base64: %w", env, i+1, err)
+		}
+		if len(decoded) < 32 || len(decoded) > 64<<10 {
+			return nil, fmt.Errorf("%s key %d has an invalid decoded size", env, i+1)
+		}
+		digest := sha256.Sum256(decoded)
+		if _, duplicate := seen[digest]; duplicate {
+			return nil, fmt.Errorf("%s contains a duplicate custodian key at position %d", env, i+1)
+		}
+		seen[digest] = struct{}{}
+	}
+	return keys, nil
+}
+
+func recoveryPGPKeyDigests(keys []string) ([]string, error) {
+	digests := make([]string, 0, len(keys))
+	for i, key := range keys {
+		decoded, err := base64.StdEncoding.Strict().DecodeString(key)
+		if err != nil {
+			return nil, fmt.Errorf("custodian key %d is not strict base64: %w", i+1, err)
+		}
+		digest := sha256.Sum256(decoded)
+		digests = append(digests, hex.EncodeToString(digest[:]))
+	}
+	return digests, nil
 }
 
 func boolFromEnv(env string, def bool) bool {

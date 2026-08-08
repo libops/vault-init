@@ -2,48 +2,56 @@
 
 The `vault-init` service automates the process of [initializing](https://www.vaultproject.io/docs/commands/operator/init.html) and [unsealing](https://www.vaultproject.io/docs/concepts/seal.html#unsealing) HashiCorp Vault instances running on [Google Cloud Platform](https://cloud.google.com).
 
-After `vault-init` initializes a Vault server it stores master keys and root tokens, encrypted using [Google Cloud KMS](https://cloud.google.com/kms), to a user defined [Google Cloud Storage](https://cloud.google.com/storage) bucket.
+After `vault-init` initializes a Vault server it stores only root-token-free
+recovery material, encrypted using [Google Cloud KMS](https://cloud.google.com/kms),
+in a user-defined [Google Cloud Storage](https://cloud.google.com/storage)
+bucket. It enables a non-raw JSON audit device on Vault stdout, revokes and
+verifies the initial root token, and then writes a non-secret bootstrap
+completion record. The initial root token is never written to GCS.
 
 Vault returns its initial recovery material only once. Before sending the
 initialization request, this service verifies that neither destination object
 already exists, that KMS can encrypt and decrypt a round-trip probe, and that
 the workload can commit and read back a unique non-secret, create-only GCS
 marker. The retained `vault-init-preflight/` marker is intentional because the
-runtime has no object-delete permission. A graceful shutdown received before
+initializer has no object-delete permission. A graceful shutdown received before
 the initialization request is sent aborts safely and leaves a one-shot job
 retryable. Once the request is committed, the service ignores graceful
 shutdown, retains a successful response in memory, and retries KMS and GCS with
 bounded exponential backoff. GCS writes use a create-only precondition. A run
 is complete only after each write is confirmed committed: either the writer
 `Close` succeeds or a byte-identical create-only object is read back after an
-ambiguous close result. The
-complete encrypted initialization response is stored before the convenience
-root-token object, so a partial two-object write still preserves all recovery
-material. If the successful response is malformed or fails partway through a
-read, the bytes received are encrypted and stored before the process reports
-failure, and the convenience object is not created. Operators must avoid
+ambiguous close result. The validated recovery response is stripped of its
+root token before encryption. An unreadable or malformed response is not
+persisted because it may contain a live root credential. Operators must avoid
 forcibly terminating the initializer between
 Vault accepting `/v1/sys/init` and the "Initialization complete" log entry.
 
-Every run that finds Vault already initialized verifies that both encrypted
-objects exist and are non-empty before exiting successfully. This makes a
-Cloud Run retry idempotent when the first task stored the response but lost its
-final client response. If only `root-token.enc` is missing, the retry decrypts
-the complete response and recreates that convenience object with the same
-create-only protection. If `unseal-keys.json.enc` is missing, the one-time Vault
-response cannot be reconstructed: the process exits nonzero and repeated job
-attempts will continue to fail rather than silently claiming success. The
+Every run that finds Vault already initialized verifies the encrypted recovery
+bundle, proves that it contains no root token, validates the bootstrap marker,
+and fails if the legacy `root-token.enc` object exists. A crash after the
+recovery bundle becomes durable but before audit/root revocation completes
+requires a recovery-key-quorum operator repair; an automated retry cannot and
+must not recover a durable root token. If `unseal-keys.json.enc` or
+`bootstrap-complete.json` is missing, the process exits nonzero rather than
+silently claiming success. The
 default Cloud Run Job policy [retries a failed task three
 times](https://cloud.google.com/run/docs/configuring/max-retries). Those retries
 can bridge transient GCS errors, but they cannot repair a missing recovery
 bundle. Configure a task timeout long enough for the post-initialization retry
-loop because forced termination or task timeout can still destroy the only
-in-memory copy.
+loop because forced termination or task timeout can still interrupt secure
+bootstrap.
+
+For auto-unseal, the default is five recovery shares with a threshold of three.
+Assign them to independent named custodians and test a quorum-based generate-root
+procedure. A recovery bucket plus a KMS key controlled by one identity is not
+independent custody.
 
 ## Usage
 
-The `vault-init` service is designed to be run alongside a Vault server and
-communicate over local host.
+The `vault-init` service can run beside Vault for development or as a one-shot
+job through the authenticated Vault Proxy URL. Production uses the latter so
+the initializer, public proxy, and Vault runtime keep separate identities.
 
 You can download the code and compile the binary with Go. Release images are
 published as one signed multi-platform manifest to both GHCR and the public
@@ -107,11 +115,11 @@ The `vault-init` service supports the following environment variables for config
   the privileged Google access token and initialization redirects would also
   make commit state ambiguous.
 
-- `GCS_BUCKET_NAME` - The Google Cloud Storage Bucket where the Vault master key
-  and root token is stored.
+- `GCS_BUCKET_NAME` - The Google Cloud Storage bucket where root-token-free
+  recovery material and the non-secret completion record are stored.
 
 - `KMS_KEY_ID` - The Google Cloud KMS key ID used to encrypt and decrypt the
-  vault master key and root token.
+  Vault recovery bundle.
 
 - `VAULT_SECRET_SHARES` (5) - The number of human shares to create.
 
@@ -123,11 +131,17 @@ The `vault-init` service supports the following environment variables for config
 - `VAULT_STORED_SHARES` (1) - Number of shares to store on KMS. Only applies to
   Vault 1.0 native auto-unseal.
 
-- `VAULT_RECOVERY_SHARES` (1) - Number of recovery shares to generate. Only
+- `VAULT_RECOVERY_SHARES` (5) - Number of recovery shares to generate. Only
   applies to Vault 1.0 native auto-unseal.
 
-- `VAULT_RECOVERY_THRESHOLD` (1) - Number of recovery shares needed to trigger an auto-unseal.
+- `VAULT_RECOVERY_THRESHOLD` (3) - Number of recovery shares needed to authorize recovery operations.
   Only applies to Vault 1.0 native auto-unseal.
+
+- `VAULT_RECOVERY_PGP_KEYS` - Required with auto-unseal. A JSON array whose
+  length equals `VAULT_RECOVERY_SHARES`; each entry is a distinct
+  base64-encoded binary PGP public key owned by an independent custodian. Vault
+  encrypts each returned recovery share to the corresponding key. Private PGP
+  keys must never be provided to this service.
 
 - `VAULT_SKIP_VERIFY` (false) - Disable TLS validation when connecting. Setting
   to true is highly discouraged. TLS 1.2 or newer is required by default.
@@ -177,6 +191,13 @@ the required create/read permissions without granting this workload delete or
 overwrite access. Use a dedicated bucket for each Vault deployment and protect
 it with retention, versioning, restricted administration, and an independently
 tested recovery procedure.
+
+Existing deployments that contain `root-token.enc` or a root token inside
+`unseal-keys.json.enc` must be migrated under dual control: decrypt in a
+restricted recovery session, revoke the retained token, write a root-token-free
+bundle, remove the legacy object, enable and verify the `cloudrun/` stdout audit
+device, and write the completion marker. Do not copy decrypted material through
+Terraform, CI, tickets, chat, or shell arguments.
 
 For more information on service accounts, please see the
 [Google Cloud Service Accounts documentation][service-accounts].

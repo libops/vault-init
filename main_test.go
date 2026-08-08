@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -24,6 +26,15 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
+}
+
+func testRecoveryPGPKeys() []string {
+	keys := make([]string, 5)
+	for i := range keys {
+		decoded := bytes.Repeat([]byte{byte(i + 1)}, 64)
+		keys[i] = base64.StdEncoding.EncodeToString(decoded)
+	}
+	return keys
 }
 
 type scriptedWriteCloser struct {
@@ -49,8 +60,8 @@ func (w *scriptedWriteCloser) Close() error {
 	return w.closeErr
 }
 
-func TestRetryInitializationPersistenceRetainsOneTimeResponse(t *testing.T) {
-	initResponse := []byte(`{"keys_base64":["key"],"root_token":"root"}`)
+func TestRetryRecoveryPersistenceNeverStoresRootToken(t *testing.T) {
+	initResponse := InitResponse{KeysBase64: []string{"key"}, RootToken: "root"}
 	encryptCalls := 0
 	encrypt := func(_ context.Context, plaintext []byte) ([]byte, error) {
 		encryptCalls++
@@ -64,25 +75,17 @@ func TestRetryInitializationPersistenceRetainsOneTimeResponse(t *testing.T) {
 		name string
 		data []byte
 	}
-	rootWriteAttempts := 0
 	store := func(_ context.Context, name string, ciphertext []byte) error {
 		writes = append(writes, struct {
 			name string
 			data []byte
 		}{name: name, data: bytes.Clone(ciphertext)})
-		if name == rootTokenObjectName {
-			rootWriteAttempts++
-			if rootWriteAttempts == 1 {
-				return errors.New("transient GCS failure")
-			}
-		}
 		return nil
 	}
 
 	var waits []time.Duration
-	err := retryInitializationPersistence(
+	err := retryRecoveryPersistence(
 		initResponse,
-		"root",
 		encrypt,
 		store,
 		func(delay time.Duration) { waits = append(waits, delay) },
@@ -91,38 +94,36 @@ func TestRetryInitializationPersistenceRetainsOneTimeResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if encryptCalls != 3 {
-		t.Fatalf("encrypt calls = %d, want 3", encryptCalls)
+	if encryptCalls != 2 {
+		t.Fatalf("encrypt calls = %d, want 2", encryptCalls)
 	}
-	if !reflect.DeepEqual(waits, []time.Duration{time.Second, 2 * time.Second}) {
+	if !reflect.DeepEqual(waits, []time.Duration{time.Second}) {
 		t.Fatalf("retry delays = %v", waits)
 	}
-	wantWrites := []struct {
-		name string
-		data []byte
-	}{
-		{name: unsealKeysObjectName, data: append([]byte("encrypted:"), initResponse...)},
-		{name: rootTokenObjectName, data: []byte("encrypted:root")},
-		{name: rootTokenObjectName, data: []byte("encrypted:root")},
+	if len(writes) != 1 || writes[0].name != unsealKeysObjectName {
+		t.Fatalf("writes = %#v, want only recovery bundle", writes)
 	}
-	if !reflect.DeepEqual(writes, wantWrites) {
-		t.Fatalf("writes = %#v, want %#v", writes, wantWrites)
+	plaintext := bytes.TrimPrefix(writes[0].data, []byte("encrypted:"))
+	var stored InitResponse
+	if err := json.Unmarshal(plaintext, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.RootToken != "" || !reflect.DeepEqual(stored.KeysBase64, []string{"key"}) {
+		t.Fatalf("stored recovery = %#v, want keys without root token", stored)
 	}
 }
 
-func TestRetryInitializationPersistenceMakesRecoveryBundleDurableBeforeRootTokenWork(t *testing.T) {
-	initResponse := []byte(`{"keys_base64":["key"],"root_token":"root"}`)
+func TestRetryRecoveryPersistenceHasNoRootTokenWork(t *testing.T) {
+	initResponse := InitResponse{KeysBase64: []string{"key"}, RootToken: "root"}
 	var events []string
-	err := retryInitializationPersistence(
+	err := retryRecoveryPersistence(
 		initResponse,
-		"root",
 		func(_ context.Context, plaintext []byte) ([]byte, error) {
-			if bytes.Equal(plaintext, initResponse) {
-				events = append(events, "encrypt bundle")
-				return []byte("bundle"), nil
+			if bytes.Contains(plaintext, []byte(`"root_token":"root"`)) {
+				t.Fatal("root token reached encryption")
 			}
-			events = append(events, "encrypt root")
-			return []byte("token"), nil
+			events = append(events, "encrypt bundle")
+			return []byte("bundle"), nil
 		},
 		func(_ context.Context, name string, _ []byte) error {
 			events = append(events, "store "+name)
@@ -136,34 +137,44 @@ func TestRetryInitializationPersistenceMakesRecoveryBundleDurableBeforeRootToken
 	want := []string{
 		"encrypt bundle",
 		"store " + unsealKeysObjectName,
-		"encrypt root",
-		"store " + rootTokenObjectName,
 	}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("events = %v, want %v", events, want)
 	}
 }
 
-func TestRetryInitializationPersistencePreservesUnexpectedResponse(t *testing.T) {
-	response := []byte(`{"unexpected":"response"}`)
-	var writes []string
-	err := retryInitializationPersistence(
-		response,
-		"",
-		func(_ context.Context, plaintext []byte) ([]byte, error) {
-			return append([]byte("encrypted:"), plaintext...), nil
-		},
-		func(_ context.Context, name string, _ []byte) error {
-			writes = append(writes, name)
-			return nil
-		},
-		func(time.Duration) { t.Fatal("unexpected retry") },
-	)
-	if err == nil || !strings.Contains(err.Error(), "complete encrypted response is durable") {
-		t.Fatalf("error = %v, want durable-bundle warning", err)
+func TestPersistBootstrapCompletionRecordsAuditAndRevocation(t *testing.T) {
+	originalShares := vaultRecoveryShares
+	originalThreshold := vaultRecoveryThreshold
+	originalKeys := vaultRecoveryPGPKeys
+	t.Cleanup(func() {
+		vaultRecoveryShares = originalShares
+		vaultRecoveryThreshold = originalThreshold
+		vaultRecoveryPGPKeys = originalKeys
+	})
+	vaultRecoveryShares = 5
+	vaultRecoveryThreshold = 3
+	vaultRecoveryPGPKeys = testRecoveryPGPKeys()
+
+	var name string
+	var record []byte
+	if err := persistBootstrapCompletion(func(_ context.Context, objectName string, data []byte) error {
+		name = objectName
+		record = bytes.Clone(data)
+		return nil
+	}, func(time.Duration) { t.Fatal("unexpected retry") }); err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(writes, []string{unsealKeysObjectName}) {
-		t.Fatalf("writes = %v, want only recovery bundle", writes)
+	if name != bootstrapCompleteObjectName {
+		t.Fatalf("object = %q", name)
+	}
+	var completion bootstrapCompletion
+	if err := json.Unmarshal(record, &completion); err != nil {
+		t.Fatal(err)
+	}
+	if completion.SchemaVersion != 1 || completion.AuditPath != "cloudrun" || !completion.RootTokenRevoked ||
+		completion.RecoveryShares != 5 || completion.RecoveryThreshold != 3 || len(completion.CustodianKeySHA256) != 5 {
+		t.Fatalf("completion = %#v", completion)
 	}
 }
 
@@ -427,35 +438,44 @@ func TestVerifyStoredRecoveryMaterial(t *testing.T) {
 		{
 			name: "complete",
 			sizes: map[string]int64{
-				unsealKeysObjectName: 512,
-				rootTokenObjectName:  128,
+				unsealKeysObjectName:        512,
+				bootstrapCompleteObjectName: 128,
 			},
 		},
 		{
 			name:      "missing mandatory recovery bundle",
-			sizes:     map[string]int64{rootTokenObjectName: 128},
+			sizes:     map[string]int64{bootstrapCompleteObjectName: 128},
 			wantError: unsealKeysObjectName + " is missing",
 		},
 		{
-			name:      "missing convenience root token",
+			name:      "missing bootstrap completion",
 			sizes:     map[string]int64{unsealKeysObjectName: 512},
-			wantError: rootTokenObjectName + " is missing",
+			wantError: bootstrapCompleteObjectName + " is missing",
 		},
 		{
 			name: "empty mandatory recovery bundle",
 			sizes: map[string]int64{
-				unsealKeysObjectName: 0,
-				rootTokenObjectName:  128,
+				unsealKeysObjectName:        0,
+				bootstrapCompleteObjectName: 128,
 			},
 			wantError: unsealKeysObjectName + " is empty",
 		},
 		{
-			name: "empty convenience root token",
+			name: "empty bootstrap completion",
 			sizes: map[string]int64{
-				unsealKeysObjectName: 512,
-				rootTokenObjectName:  0,
+				unsealKeysObjectName:        512,
+				bootstrapCompleteObjectName: 0,
 			},
-			wantError: rootTokenObjectName + " is empty",
+			wantError: bootstrapCompleteObjectName + " is empty",
+		},
+		{
+			name: "legacy root token retained",
+			sizes: map[string]int64{
+				unsealKeysObjectName:        512,
+				bootstrapCompleteObjectName: 128,
+				rootTokenObjectName:         64,
+			},
+			wantError: rootTokenObjectName + " still exists",
 		},
 		{
 			name:      "lookup failure",
@@ -490,57 +510,180 @@ func TestVerifyStoredRecoveryMaterial(t *testing.T) {
 	}
 }
 
-func TestRestoreRootTokenObjectFromDurableResponse(t *testing.T) {
-	response := []byte(`{"keys_base64":["key"],"root_token":"root"}`)
-	var storedName string
-	var storedData []byte
-	err := restoreRootTokenObject(
-		context.Background(),
-		func(_ context.Context, name string) ([]byte, error) {
-			if name != unsealKeysObjectName {
-				t.Fatalf("read object = %q", name)
+func TestVerifyRecoveryBundleContentsRejectsRetainedRootToken(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		response  string
+		wantError string
+	}{
+		{name: "root free", response: `{"recovery_keys_base64":["key"]}`},
+		{name: "retained root", response: `{"recovery_keys_base64":["key"],"root_token":"root"}`, wantError: "retains an initial root token"},
+		{name: "no keys", response: `{}`, wantError: "contains no recovery or unseal keys"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := verifyRecoveryBundleContents(
+				context.Background(),
+				func(context.Context, string) ([]byte, error) { return []byte("encrypted"), nil },
+				func(context.Context, []byte) ([]byte, error) { return []byte(test.response), nil },
+			)
+			if test.wantError == "" && err != nil {
+				t.Fatal(err)
 			}
-			return append([]byte("encrypted:"), response...), nil
-		},
-		func(_ context.Context, ciphertext []byte) ([]byte, error) {
-			return bytes.TrimPrefix(ciphertext, []byte("encrypted:")), nil
-		},
-		func(_ context.Context, plaintext []byte) ([]byte, error) {
-			return append([]byte("encrypted:"), plaintext...), nil
-		},
-		func(_ context.Context, name string, data []byte) error {
-			storedName = name
-			storedData = bytes.Clone(data)
-			return nil
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if storedName != rootTokenObjectName {
-		t.Fatalf("stored object = %q", storedName)
-	}
-	if string(storedData) != "encrypted:root" {
-		t.Fatalf("stored data = %q", storedData)
+			if test.wantError != "" && (err == nil || !strings.Contains(err.Error(), test.wantError)) {
+				t.Fatalf("error = %v, want %q", err, test.wantError)
+			}
+		})
 	}
 }
 
-func TestRestoreRootTokenObjectRejectsUnusableResponse(t *testing.T) {
-	err := restoreRootTokenObject(
-		context.Background(),
-		func(context.Context, string) ([]byte, error) { return []byte("encrypted"), nil },
-		func(context.Context, []byte) ([]byte, error) { return []byte(`{"keys_base64":["key"]}`), nil },
-		func(context.Context, []byte) ([]byte, error) {
-			t.Fatal("root token encryption ran for unusable response")
-			return nil, nil
+func TestVerifyBootstrapCompletion(t *testing.T) {
+	validRecord := bootstrapCompletion{
+		SchemaVersion:     1,
+		AuditPath:         "cloudrun",
+		RootTokenRevoked:  true,
+		RecoveryShares:    5,
+		RecoveryThreshold: 3,
+		CustodianKeySHA256: []string{
+			strings.Repeat("a", 64),
+			strings.Repeat("b", 64),
+			strings.Repeat("c", 64),
+			strings.Repeat("d", 64),
+			strings.Repeat("e", 64),
 		},
-		func(context.Context, string, []byte) error {
-			t.Fatal("root token write ran for unusable response")
-			return nil
-		},
-	)
-	if err == nil || !strings.Contains(err.Error(), "did not contain a root token") {
-		t.Fatalf("error = %v, want missing root token", err)
+	}
+	valid := string(mustJSON(t, validRecord))
+	duplicateRecord := validRecord
+	duplicateRecord.CustodianKeySHA256 = append([]string(nil), validRecord.CustodianKeySHA256...)
+	duplicateRecord.CustodianKeySHA256[4] = duplicateRecord.CustodianKeySHA256[3]
+	invalidFingerprintRecord := validRecord
+	invalidFingerprintRecord.CustodianKeySHA256 = append([]string(nil), validRecord.CustodianKeySHA256...)
+	invalidFingerprintRecord.CustodianKeySHA256[4] = "not-a-sha256"
+	for _, test := range []struct {
+		name      string
+		record    string
+		wantError bool
+	}{
+		{name: "valid", record: valid},
+		{name: "audit missing", record: `{"schema_version":1,"root_token_revoked":true}`, wantError: true},
+		{name: "root live", record: `{"schema_version":1,"audit_path":"cloudrun"}`, wantError: true},
+		{name: "duplicate custodian", record: string(mustJSON(t, duplicateRecord)), wantError: true},
+		{name: "invalid fingerprint", record: string(mustJSON(t, invalidFingerprintRecord)), wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := verifyBootstrapCompletion(context.Background(), func(context.Context, string) ([]byte, error) {
+				return []byte(test.record), nil
+			})
+			if (err != nil) != test.wantError {
+				t.Fatalf("error = %v, wantError = %t", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestRecoveryPGPKeysRequireIndependentQuorum(t *testing.T) {
+	validKeys := testRecoveryPGPKeys()
+	t.Setenv("TEST_RECOVERY_PGP_KEYS", string(mustJSON(t, validKeys)))
+	got, err := recoveryPGPKeysFromEnv("TEST_RECOVERY_PGP_KEYS", 5, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, validKeys) {
+		t.Fatalf("keys changed")
+	}
+
+	tests := []struct {
+		name      string
+		keys      []string
+		shares    int
+		threshold int
+	}{
+		{name: "one of one", keys: validKeys[:1], shares: 1, threshold: 1},
+		{name: "missing custodian", keys: validKeys[:4], shares: 5, threshold: 3},
+		{name: "duplicate", keys: []string{validKeys[0], validKeys[1], validKeys[2], validKeys[3], validKeys[3]}, shares: 5, threshold: 3},
+		{name: "invalid base64", keys: []string{validKeys[0], validKeys[1], validKeys[2], validKeys[3], "not-base64"}, shares: 5, threshold: 3},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("TEST_RECOVERY_PGP_KEYS", string(mustJSON(t, test.keys)))
+			if _, err := recoveryPGPKeysFromEnv("TEST_RECOVERY_PGP_KEYS", test.shares, test.threshold); err == nil {
+				t.Fatal("unsafe recovery custody accepted")
+			}
+		})
+	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestSecureBootstrapEnablesAuditBeforeRevokingRoot(t *testing.T) {
+	originalVaultAddr := vaultAddr
+	originalHTTPClient := httpClient
+	originalMetadataClient := metadataClient
+	t.Cleanup(func() {
+		vaultAddr = originalVaultAddr
+		httpClient = originalHTTPClient
+		metadataClient = originalMetadataClient
+	})
+
+	metadataClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"access_token":"proxy-admin"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	auditEnabled := false
+	rootRevoked := false
+	var events []string
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("X-Admin-Token") != "proxy-admin" || request.Header.Get("X-Vault-Token") != "initial-root" {
+			t.Errorf("privileged headers were not separated")
+		}
+		switch request.Method + " " + request.URL.Path {
+		case "GET /v1/sys/audit":
+			if !auditEnabled {
+				_, _ = response.Write([]byte(`{}`))
+				return
+			}
+			_, _ = response.Write([]byte(`{"cloudrun/":{"type":"file","options":{"file_path":"stdout","log_raw":"false"}}}`))
+		case "POST /v1/sys/audit/cloudrun":
+			events = append(events, "audit")
+			auditEnabled = true
+			response.WriteHeader(http.StatusNoContent)
+		case "POST /v1/auth/token/revoke-self":
+			if !auditEnabled {
+				t.Error("root token was revoked before audit was enabled")
+			}
+			events = append(events, "revoke")
+			rootRevoked = true
+			response.WriteHeader(http.StatusNoContent)
+		case "GET /v1/auth/token/lookup-self":
+			events = append(events, "verify")
+			if rootRevoked {
+				response.WriteHeader(http.StatusForbidden)
+				return
+			}
+			response.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected Vault request %s %s", request.Method, request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	vaultAddr = server.URL
+	httpClient = server.Client()
+
+	if err := enableAuditAndRevokeInitialRoot("initial-root"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"audit", "revoke", "verify"}) {
+		t.Fatalf("events = %v", events)
 	}
 }
 
