@@ -755,7 +755,7 @@ func doRootVaultRequest(method, requestPath string, payload []byte, rootToken st
 		return 0, nil, err
 	}
 	if len(responseBody) > maxEncryptedBundle {
-		return 0, nil, fmt.Errorf("Vault response exceeds %d bytes", maxEncryptedBundle)
+		return 0, nil, fmt.Errorf("vault response exceeds %d bytes", maxEncryptedBundle)
 	}
 	return response.StatusCode, responseBody, nil
 }
