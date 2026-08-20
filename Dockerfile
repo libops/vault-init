@@ -1,4 +1,4 @@
-FROM ghcr.io/libops/go:1.26.5@sha256:ea764e85e42a243217c621891123b3fda9374674c29d59785414fc6b15815b3d AS builder
+FROM ghcr.io/libops/go:1.26.5@sha256:d85512043bfe75184bb76080c28d24de3e3b9b9ab3cc4e3c080ad04bf64724c1 AS builder
 
 SHELL ["/bin/ash", "-o", "pipefail", "-ex", "-c"]
 
