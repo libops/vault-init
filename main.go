@@ -154,9 +154,11 @@ func main() {
 		vaultStoredShares = intFromEnv("VAULT_STORED_SHARES", 1)
 		vaultRecoveryShares = intFromEnv("VAULT_RECOVERY_SHARES", 5)
 		vaultRecoveryThreshold = intFromEnv("VAULT_RECOVERY_THRESHOLD", 3)
-		vaultRecoveryPGPKeys, err = recoveryPGPKeysFromEnv("VAULT_RECOVERY_PGP_KEYS", vaultRecoveryShares, vaultRecoveryThreshold)
-		if err != nil {
-			log.Fatal(err)
+		if strings.TrimSpace(os.Getenv("VAULT_RECOVERY_PGP_KEYS")) != "" {
+			vaultRecoveryPGPKeys, err = recoveryPGPKeysFromEnv("VAULT_RECOVERY_PGP_KEYS", vaultRecoveryShares, vaultRecoveryThreshold)
+			if err != nil {
+				log.Fatal(err)
+			}
 		}
 	}
 
@@ -970,8 +972,8 @@ func verifyBootstrapCompletion(ctx context.Context, read encryptedSecretReader) 
 	if record.SchemaVersion != 1 || record.AuditPath != "cloudrun" || !record.RootTokenRevoked ||
 		record.RecoveryShares < 3 || record.RecoveryThreshold < 2 ||
 		record.RecoveryThreshold > record.RecoveryShares ||
-		len(record.CustodianKeySHA256) != record.RecoveryShares {
-		return fmt.Errorf("secure bootstrap completion does not prove the required audit device, root-token revocation, and independent recovery quorum")
+		(len(record.CustodianKeySHA256) != 0 && len(record.CustodianKeySHA256) != record.RecoveryShares) {
+		return fmt.Errorf("secure bootstrap completion does not prove the required audit device, root-token revocation, and recovery threshold")
 	}
 	seen := make(map[string]struct{}, len(record.CustodianKeySHA256))
 	for _, fingerprint := range record.CustodianKeySHA256 {

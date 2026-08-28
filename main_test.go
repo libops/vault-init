@@ -178,6 +178,35 @@ func TestPersistBootstrapCompletionRecordsAuditAndRevocation(t *testing.T) {
 	}
 }
 
+func TestPersistBootstrapCompletionWithoutCustodianPGPKeys(t *testing.T) {
+	originalShares := vaultRecoveryShares
+	originalThreshold := vaultRecoveryThreshold
+	originalKeys := vaultRecoveryPGPKeys
+	t.Cleanup(func() {
+		vaultRecoveryShares = originalShares
+		vaultRecoveryThreshold = originalThreshold
+		vaultRecoveryPGPKeys = originalKeys
+	})
+	vaultRecoveryShares = 5
+	vaultRecoveryThreshold = 3
+	vaultRecoveryPGPKeys = nil
+
+	var record []byte
+	if err := persistBootstrapCompletion(func(_ context.Context, _ string, data []byte) error {
+		record = bytes.Clone(data)
+		return nil
+	}, func(time.Duration) { t.Fatal("unexpected retry") }); err != nil {
+		t.Fatal(err)
+	}
+	var completion bootstrapCompletion
+	if err := json.Unmarshal(record, &completion); err != nil {
+		t.Fatal(err)
+	}
+	if completion.RecoveryShares != 5 || completion.RecoveryThreshold != 3 || len(completion.CustodianKeySHA256) != 0 {
+		t.Fatalf("completion = %#v", completion)
+	}
+}
+
 func TestProcessTLSConfigReadsCertificatesFromCAPath(t *testing.T) {
 	server := httptest.NewTLSServer(nil)
 	server.Close()
@@ -558,12 +587,15 @@ func TestVerifyBootstrapCompletion(t *testing.T) {
 	invalidFingerprintRecord := validRecord
 	invalidFingerprintRecord.CustodianKeySHA256 = append([]string(nil), validRecord.CustodianKeySHA256...)
 	invalidFingerprintRecord.CustodianKeySHA256[4] = "not-a-sha256"
+	kmsProtectedRecord := validRecord
+	kmsProtectedRecord.CustodianKeySHA256 = nil
 	for _, test := range []struct {
 		name      string
 		record    string
 		wantError bool
 	}{
 		{name: "valid", record: valid},
+		{name: "valid KMS protected bundle", record: string(mustJSON(t, kmsProtectedRecord))},
 		{name: "audit missing", record: `{"schema_version":1,"root_token_revoked":true}`, wantError: true},
 		{name: "root live", record: `{"schema_version":1,"audit_path":"cloudrun"}`, wantError: true},
 		{name: "duplicate custodian", record: string(mustJSON(t, duplicateRecord)), wantError: true},

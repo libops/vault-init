@@ -43,9 +43,10 @@ loop because forced termination or task timeout can still interrupt secure
 bootstrap.
 
 For auto-unseal, the default is five recovery shares with a threshold of three.
-Assign them to independent named custodians and test a quorum-based generate-root
-procedure. A recovery bucket plus a KMS key controlled by one identity is not
-independent custody.
+By default Vault returns those shares to the initializer, which removes the
+initial root token, encrypts the recovery bundle with Google KMS, and stores
+only ciphertext in GCS. Operators that require independent human custody may
+add one PGP public key per recovery share.
 
 ## Usage
 
@@ -137,11 +138,12 @@ The `vault-init` service supports the following environment variables for config
 - `VAULT_RECOVERY_THRESHOLD` (3) - Number of recovery shares needed to authorize recovery operations.
   Only applies to Vault 1.0 native auto-unseal.
 
-- `VAULT_RECOVERY_PGP_KEYS` - Required with auto-unseal. A JSON array whose
+- `VAULT_RECOVERY_PGP_KEYS` - Optional JSON array whose
   length equals `VAULT_RECOVERY_SHARES`; each entry is a distinct
   base64-encoded binary PGP public key owned by an independent custodian. Vault
-  encrypts each returned recovery share to the corresponding key. Private PGP
-  keys must never be provided to this service.
+  encrypts each returned recovery share to the corresponding key. When omitted,
+  the initializer protects the returned recovery bundle with Google KMS before
+  storing it in GCS. Private PGP keys must never be provided to this service.
 
 - `VAULT_SKIP_VERIFY` (false) - Disable TLS validation when connecting. Setting
   to true is highly discouraged. TLS 1.2 or newer is required by default.

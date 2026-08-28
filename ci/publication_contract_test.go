@@ -105,7 +105,7 @@ func TestReleasePublishesTheTaggedImage(t *testing.T) {
 func TestDockerfileBuildsNativeNonRootScratchImages(t *testing.T) {
 	dockerfile := readFile(t, "Dockerfile")
 	for _, required := range []string{
-		"FROM ghcr.io/libops/go:1.26.5@sha256:",
+		"FROM ghcr.io/libops/go:1.26.6@sha256:",
 		"FROM scratch",
 		"USER 65532:65532",
 		"ENTRYPOINT [\"/bin/vault-init\"]",
