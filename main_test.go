@@ -684,7 +684,7 @@ func TestSecureBootstrapEnablesAuditBeforeRevokingRoot(t *testing.T) {
 				_, _ = response.Write([]byte(`{}`))
 				return
 			}
-			_, _ = response.Write([]byte(`{"cloudrun/":{"type":"file","options":{"file_path":"stdout","log_raw":"false"}}}`))
+			_, _ = response.Write([]byte(`{"request_id":"audit-list","lease_id":"","renewable":false,"lease_duration":0,"data":{"cloudrun/":{"type":"file","options":{"file_path":"stdout","log_raw":"false"}}},"wrap_info":null,"warnings":null,"auth":null,"mount_type":"system"}`))
 		case "POST /v1/sys/audit/cloudrun":
 			events = append(events, "audit")
 			auditEnabled = true
