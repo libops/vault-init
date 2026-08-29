@@ -851,14 +851,14 @@ func TestDecodeGeneratedRootToken(t *testing.T) {
 		encoded[i] = token[i] ^ otp[i]
 	}
 
-	got, err := decodeGeneratedRootToken(base64.StdEncoding.EncodeToString(encoded), string(otp))
+	got, err := decodeGeneratedRootToken(base64.RawStdEncoding.EncodeToString(encoded), string(otp))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != string(token) {
 		t.Fatalf("token = %q, want %q", got, token)
 	}
-	if _, err := decodeGeneratedRootToken(base64.StdEncoding.EncodeToString(encoded[:len(encoded)-1]), string(otp)); err == nil {
+	if _, err := decodeGeneratedRootToken(base64.RawStdEncoding.EncodeToString(encoded[:len(encoded)-1]), string(otp)); err == nil {
 		t.Fatal("mismatched OTP and encoded token lengths were accepted")
 	}
 }
@@ -957,7 +957,7 @@ func TestResumeIncompleteKMSBootstrap(t *testing.T) {
 				"required": 3, "complete": rootGenerationComplete,
 			}
 			if rootGenerationComplete {
-				result["encoded_token"] = base64.StdEncoding.EncodeToString(encodedToken)
+				result["encoded_token"] = base64.RawStdEncoding.EncodeToString(encodedToken)
 			}
 			writeJSON(response, result)
 		case "GET /v1/sys/audit":

@@ -1192,7 +1192,7 @@ func generateRecoveryRootToken(recovery InitResponse) (string, error) {
 }
 
 func decodeGeneratedRootToken(encodedToken, otp string) (string, error) {
-	encoded, err := base64.StdEncoding.DecodeString(encodedToken)
+	encoded, err := base64.RawStdEncoding.DecodeString(encodedToken)
 	if err != nil {
 		return "", fmt.Errorf("decode generated root token: %w", err)
 	}
