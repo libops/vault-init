@@ -982,7 +982,10 @@ func TestResumeIncompleteKMSBootstrap(t *testing.T) {
 			writeJSON(response, map[string]any{"data": map[string]any{
 				"accessor": "repair-accessor", "policies": []string{"root"},
 			}})
-		case "LIST /v1/auth/token/accessors":
+		case "GET /v1/auth/token/accessors":
+			if request.URL.Query().Get("list") != "true" {
+				t.Fatalf("token accessor request omitted list=true: %s", request.URL.RawQuery)
+			}
 			accessors := []string{"repair-accessor", "application-accessor"}
 			if initialRootLive {
 				accessors = append(accessors, "initial-root-accessor")

@@ -1288,7 +1288,7 @@ func lookupSelfToken(rootToken string) (tokenData, error) {
 }
 
 func listTokenAccessors(rootToken string) ([]string, error) {
-	status, body, err := doRootVaultRequest("LIST", "/v1/auth/token/accessors", nil, rootToken)
+	status, body, err := doRootVaultRequest(http.MethodGet, "/v1/auth/token/accessors?list=true", nil, rootToken)
 	if err != nil {
 		return nil, fmt.Errorf("list token accessors: %w", err)
 	}
