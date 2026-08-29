@@ -719,6 +719,363 @@ func TestSecureBootstrapEnablesAuditBeforeRevokingRoot(t *testing.T) {
 	}
 }
 
+func TestSecureBootstrapRetriesTransientAuditFailure(t *testing.T) {
+	originalVaultAddr := vaultAddr
+	originalHTTPClient := httpClient
+	originalMetadataClient := metadataClient
+	t.Cleanup(func() {
+		vaultAddr = originalVaultAddr
+		httpClient = originalHTTPClient
+		metadataClient = originalMetadataClient
+	})
+
+	metadataClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"access_token":"proxy-admin"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	auditReads := 0
+	rootRevoked := false
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.Method + " " + request.URL.Path {
+		case "GET /v1/sys/audit":
+			auditReads++
+			if auditReads == 1 {
+				response.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_, _ = response.Write([]byte(`{"cloudrun/":{"type":"file","options":{"file_path":"stdout","log_raw":"false"}}}`))
+		case "POST /v1/auth/token/revoke-self":
+			rootRevoked = true
+			response.WriteHeader(http.StatusNoContent)
+		case "GET /v1/auth/token/lookup-self":
+			if rootRevoked {
+				response.WriteHeader(http.StatusForbidden)
+				return
+			}
+			response.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected Vault request %s %s", request.Method, request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	vaultAddr = server.URL
+	httpClient = server.Client()
+
+	var waits []time.Duration
+	if err := enableAuditAndRevokeInitialRootWithWait("initial-root", func(delay time.Duration) {
+		waits = append(waits, delay)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(waits, []time.Duration{time.Second}) {
+		t.Fatalf("retry waits = %v, want [1s]", waits)
+	}
+}
+
+func TestLoadIncompleteBootstrapRecoveryRequiresExactKMSState(t *testing.T) {
+	validBundle := []byte(`{"recovery_keys_base64":["one","two","three"]}`)
+	tests := []struct {
+		name      string
+		sizes     map[string]int64
+		errors    map[string]error
+		wantError string
+	}{
+		{
+			name:  "root-free bundle without completion",
+			sizes: map[string]int64{unsealKeysObjectName: 512},
+		},
+		{
+			name:      "completion already exists",
+			sizes:     map[string]int64{unsealKeysObjectName: 512, bootstrapCompleteObjectName: 128},
+			wantError: "already exists",
+		},
+		{
+			name:      "legacy root token exists",
+			sizes:     map[string]int64{unsealKeysObjectName: 512, rootTokenObjectName: 64},
+			wantError: rootTokenObjectName + " still exists",
+		},
+		{
+			name:      "recovery bundle missing",
+			wantError: unsealKeysObjectName + " is missing",
+		},
+		{
+			name:      "completion lookup failed",
+			sizes:     map[string]int64{unsealKeysObjectName: 512},
+			errors:    map[string]error{bootstrapCompleteObjectName: errors.New("storage unavailable")},
+			wantError: "storage unavailable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stat := func(_ context.Context, name string) (int64, error) {
+				if err := tt.errors[name]; err != nil {
+					return 0, err
+				}
+				if size, ok := tt.sizes[name]; ok {
+					return size, nil
+				}
+				return 0, storage.ErrObjectNotExist
+			}
+			recovery, err := loadIncompleteBootstrapRecovery(
+				context.Background(),
+				stat,
+				func(context.Context, string) ([]byte, error) { return []byte("encrypted"), nil },
+				func(context.Context, []byte) ([]byte, error) { return validBundle, nil },
+			)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(recovery.RecoveryKeysBase64, []string{"one", "two", "three"}) {
+					t.Fatalf("recovery = %#v", recovery)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("error = %v, want text %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestDecodeGeneratedRootToken(t *testing.T) {
+	token := []byte("repair-root-token")
+	otp := []byte("0123456789ABCDEFG")
+	encoded := make([]byte, len(token))
+	for i := range token {
+		encoded[i] = token[i] ^ otp[i]
+	}
+
+	got, err := decodeGeneratedRootToken(base64.StdEncoding.EncodeToString(encoded), string(otp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(token) {
+		t.Fatalf("token = %q, want %q", got, token)
+	}
+	if _, err := decodeGeneratedRootToken(base64.StdEncoding.EncodeToString(encoded[:len(encoded)-1]), string(otp)); err == nil {
+		t.Fatal("mismatched OTP and encoded token lengths were accepted")
+	}
+}
+
+func TestResumeIncompleteKMSBootstrap(t *testing.T) {
+	originalVaultAddr := vaultAddr
+	originalHTTPClient := httpClient
+	originalMetadataClient := metadataClient
+	originalShares := vaultRecoveryShares
+	originalThreshold := vaultRecoveryThreshold
+	originalPGPKeys := vaultRecoveryPGPKeys
+	t.Cleanup(func() {
+		vaultAddr = originalVaultAddr
+		httpClient = originalHTTPClient
+		metadataClient = originalMetadataClient
+		vaultRecoveryShares = originalShares
+		vaultRecoveryThreshold = originalThreshold
+		vaultRecoveryPGPKeys = originalPGPKeys
+	})
+	vaultRecoveryShares = 5
+	vaultRecoveryThreshold = 3
+	vaultRecoveryPGPKeys = nil
+
+	metadataClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"access_token":"proxy-admin"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	repairToken := []byte("repair-root-token")
+	otp := []byte("0123456789ABCDEFG")
+	encodedToken := make([]byte, len(repairToken))
+	for i := range repairToken {
+		encodedToken[i] = repairToken[i] ^ otp[i]
+	}
+
+	staleAttempt := true
+	rootGenerationStarted := false
+	rootGenerationComplete := false
+	auditEnabled := false
+	initialRootLive := true
+	repairRootLive := true
+	sharesProvided := 0
+	var events []string
+
+	writeJSON := func(response http.ResponseWriter, value any) {
+		response.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(response).Encode(value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("X-Admin-Token") != "proxy-admin" {
+			t.Errorf("%s %s omitted X-Admin-Token", request.Method, request.URL.Path)
+		}
+		isGenerationRequest := strings.HasPrefix(request.URL.Path, "/v1/sys/generate-root/")
+		if isGenerationRequest && request.Header.Get("X-Vault-Token") != "" {
+			t.Errorf("root generation unexpectedly carried a Vault token")
+		}
+		if !isGenerationRequest && request.Header.Get("X-Vault-Token") != string(repairToken) {
+			t.Errorf("%s %s used the wrong repair token", request.Method, request.URL.Path)
+		}
+
+		switch request.Method + " " + request.URL.Path {
+		case "GET /v1/sys/generate-root/attempt":
+			writeJSON(response, map[string]any{"started": staleAttempt})
+		case "DELETE /v1/sys/generate-root/attempt":
+			events = append(events, "cancel stale generation")
+			staleAttempt = false
+			response.WriteHeader(http.StatusNoContent)
+		case "POST /v1/sys/generate-root/attempt":
+			events = append(events, "start generation")
+			rootGenerationStarted = true
+			writeJSON(response, map[string]any{
+				"started": true, "nonce": "repair-nonce", "otp": string(otp),
+				"otp_length": len(otp), "required": 3, "complete": false,
+			})
+		case "POST /v1/sys/generate-root/update":
+			if !rootGenerationStarted {
+				t.Error("recovery share submitted before root generation started")
+			}
+			var payload map[string]string
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["nonce"] != "repair-nonce" || payload["key"] == "" {
+				t.Errorf("invalid recovery share payload %#v", payload)
+			}
+			sharesProvided++
+			events = append(events, "provide recovery share")
+			rootGenerationComplete = sharesProvided == 3
+			result := map[string]any{
+				"started": true, "nonce": "repair-nonce", "progress": sharesProvided,
+				"required": 3, "complete": rootGenerationComplete,
+			}
+			if rootGenerationComplete {
+				result["encoded_token"] = base64.StdEncoding.EncodeToString(encodedToken)
+			}
+			writeJSON(response, result)
+		case "GET /v1/sys/audit":
+			if !auditEnabled {
+				writeJSON(response, map[string]any{})
+				return
+			}
+			writeJSON(response, map[string]any{
+				"cloudrun/": map[string]any{
+					"type": "file", "options": map[string]string{"file_path": "stdout", "log_raw": "false"},
+				},
+			})
+		case "POST /v1/sys/audit/cloudrun":
+			events = append(events, "enable audit")
+			auditEnabled = true
+			response.WriteHeader(http.StatusNoContent)
+		case "GET /v1/auth/token/lookup-self":
+			if !repairRootLive {
+				response.WriteHeader(http.StatusForbidden)
+				return
+			}
+			writeJSON(response, map[string]any{"data": map[string]any{
+				"accessor": "repair-accessor", "policies": []string{"root"},
+			}})
+		case "LIST /v1/auth/token/accessors":
+			accessors := []string{"repair-accessor", "application-accessor"}
+			if initialRootLive {
+				accessors = append(accessors, "initial-root-accessor")
+			}
+			writeJSON(response, map[string]any{"data": map[string]any{"keys": accessors}})
+		case "POST /v1/auth/token/lookup-accessor":
+			var payload map[string]string
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			policies := []string{"default"}
+			if payload["accessor"] == "initial-root-accessor" {
+				policies = []string{"root"}
+			}
+			writeJSON(response, map[string]any{"data": map[string]any{
+				"accessor": payload["accessor"], "policies": policies,
+			}})
+		case "POST /v1/auth/token/revoke-accessor":
+			if !auditEnabled {
+				t.Error("initial root was revoked before audit was enabled")
+			}
+			var payload map[string]string
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["accessor"] != "initial-root-accessor" {
+				t.Errorf("unexpected revoked accessor %q", payload["accessor"])
+			}
+			events = append(events, "revoke orphan root")
+			initialRootLive = false
+			response.WriteHeader(http.StatusNoContent)
+		case "POST /v1/auth/token/revoke-self":
+			if !auditEnabled || initialRootLive {
+				t.Error("repair root was revoked before audited orphan-root cleanup")
+			}
+			events = append(events, "revoke repair root")
+			repairRootLive = false
+			response.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected Vault request %s %s", request.Method, request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	vaultAddr = server.URL
+	httpClient = server.Client()
+
+	var completion []byte
+	err := resumeIncompleteBootstrap(
+		InitResponse{RecoveryKeysBase64: []string{"one", "two", "three", "four", "five"}},
+		func(_ context.Context, name string, data []byte) error {
+			if initialRootLive || repairRootLive || !auditEnabled {
+				t.Fatal("completion was stored before audited root-token cleanup")
+			}
+			if name != bootstrapCompleteObjectName {
+				t.Fatalf("stored object = %q", name)
+			}
+			events = append(events, "store completion")
+			completion = bytes.Clone(data)
+			return nil
+		},
+		func(time.Duration) { t.Fatal("unexpected retry wait") },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staleAttempt || !rootGenerationComplete || initialRootLive || repairRootLive {
+		t.Fatalf("recovery state stale=%t complete=%t initialRootLive=%t repairRootLive=%t", staleAttempt, rootGenerationComplete, initialRootLive, repairRootLive)
+	}
+	if len(completion) == 0 {
+		t.Fatal("completion marker was not stored")
+	}
+	if events[len(events)-1] != "store completion" {
+		t.Fatalf("events = %v", events)
+	}
+}
+
+func TestResumeIncompleteBootstrapRejectsPGPCustody(t *testing.T) {
+	originalKeys := vaultRecoveryPGPKeys
+	t.Cleanup(func() { vaultRecoveryPGPKeys = originalKeys })
+	vaultRecoveryPGPKeys = testRecoveryPGPKeys()
+	err := resumeIncompleteBootstrap(
+		InitResponse{RecoveryKeysBase64: []string{"encrypted-share"}},
+		func(context.Context, string, []byte) error {
+			t.Fatal("completion was stored for PGP custody")
+			return nil
+		},
+		func(time.Duration) { t.Fatal("unexpected retry wait") },
+	)
+	if err == nil || !strings.Contains(err.Error(), "PGP") {
+		t.Fatalf("error = %v, want PGP refusal", err)
+	}
+}
+
 func TestPreflightInitializationChecksTargetsBeforeKMS(t *testing.T) {
 	encryptCalls := 0
 	stat := func(_ context.Context, name string) (int64, error) {

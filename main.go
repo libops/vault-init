@@ -68,6 +68,7 @@ const (
 	secretWriteTimeout          = 2 * time.Minute
 	maxSecretRetryDelay         = time.Minute
 	maxEncryptedBundle          = 256 << 10
+	maxAuditAttempts            = 5
 )
 
 type secretEncrypter func(context.Context, []byte) ([]byte, error)
@@ -109,6 +110,32 @@ type bootstrapCompletion struct {
 type auditDevice struct {
 	Type    string            `json:"type"`
 	Options map[string]string `json:"options"`
+}
+
+type rootGenerationStatus struct {
+	Started      bool   `json:"started"`
+	Nonce        string `json:"nonce"`
+	Progress     int    `json:"progress"`
+	Required     int    `json:"required"`
+	EncodedToken string `json:"encoded_token"`
+	OTP          string `json:"otp"`
+	OTPLength    int    `json:"otp_length"`
+	Complete     bool   `json:"complete"`
+}
+
+type tokenData struct {
+	Accessor string   `json:"accessor"`
+	Policies []string `json:"policies"`
+}
+
+type tokenLookupResponse struct {
+	Data tokenData `json:"data"`
+}
+
+type tokenAccessorListResponse struct {
+	Data struct {
+		Keys []string `json:"keys"`
+	} `json:"data"`
 }
 
 // UnsealRequest holds a Vault unseal request.
@@ -636,16 +663,37 @@ func persistBootstrapCompletion(store encryptedSecretStore, wait func(time.Durat
 }
 
 func enableAuditAndRevokeInitialRoot(rootToken string) error {
+	return enableAuditAndRevokeInitialRootWithWait(rootToken, time.Sleep)
+}
+
+func enableAuditAndRevokeInitialRootWithWait(rootToken string, wait func(time.Duration)) error {
 	if rootToken == "" {
 		return fmt.Errorf("initial root token is empty")
 	}
-	if err := ensureStdoutAuditDevice(rootToken); err != nil {
+	if err := retryEnsureStdoutAuditDevice(rootToken, wait); err != nil {
 		return err
 	}
 	if err := revokeInitialRootToken(rootToken); err != nil {
 		return err
 	}
 	return verifyInitialRootTokenRevoked(rootToken)
+}
+
+func retryEnsureStdoutAuditDevice(rootToken string, wait func(time.Duration)) error {
+	retryDelay := time.Second
+	var err error
+	for attempt := 1; attempt <= maxAuditAttempts; attempt++ {
+		if err = ensureStdoutAuditDevice(rootToken); err == nil {
+			return nil
+		}
+		if attempt == maxAuditAttempts {
+			break
+		}
+		log.Printf("Establishing the Vault stdout audit device failed; retrying in %s (attempt %d/%d): %v", retryDelay, attempt, maxAuditAttempts, err)
+		wait(retryDelay)
+		retryDelay = nextRetryDelay(retryDelay)
+	}
+	return fmt.Errorf("establish stdout audit device after %d attempts: %w", maxAuditAttempts, err)
 }
 
 func ensureStdoutAuditDevice(rootToken string) error {
@@ -928,6 +976,25 @@ func ensureInitializationTargetsEmpty(ctx context.Context, stat encryptedSecretS
 func verifyDurableInitialization() error {
 	ctx, cancel := context.WithTimeout(context.Background(), secretWriteTimeout)
 	defer cancel()
+	completionSize, err := statEncryptedSecret(ctx, bootstrapCompleteObjectName)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		recovery, loadErr := loadIncompleteBootstrapRecovery(
+			ctx,
+			statEncryptedSecret,
+			readEncryptedSecret,
+			decryptSecretWithKMS,
+		)
+		if loadErr != nil {
+			return loadErr
+		}
+		return resumeIncompleteBootstrap(recovery, storeEncryptedSecretOnce, time.Sleep)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect gs://%s/%s: %w", gcsBucketName, bootstrapCompleteObjectName, err)
+	}
+	if completionSize <= 0 {
+		return fmt.Errorf("gs://%s/%s is empty", gcsBucketName, bootstrapCompleteObjectName)
+	}
 	if err := verifyStoredRecoveryMaterial(ctx, statEncryptedSecret); err != nil {
 		return err
 	}
@@ -937,27 +1004,338 @@ func verifyDurableInitialization() error {
 	return verifyBootstrapCompletion(ctx, readEncryptedSecret)
 }
 
+func loadIncompleteBootstrapRecovery(
+	ctx context.Context,
+	stat encryptedSecretStat,
+	read encryptedSecretReader,
+	decrypt secretDecrypter,
+) (InitResponse, error) {
+	size, err := stat(ctx, unsealKeysObjectName)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return InitResponse{}, fmt.Errorf("gs://%s/%s is missing", gcsBucketName, unsealKeysObjectName)
+	}
+	if err != nil {
+		return InitResponse{}, fmt.Errorf("inspect gs://%s/%s: %w", gcsBucketName, unsealKeysObjectName, err)
+	}
+	if size <= 0 {
+		return InitResponse{}, fmt.Errorf("gs://%s/%s is empty", gcsBucketName, unsealKeysObjectName)
+	}
+
+	if size, err = stat(ctx, rootTokenObjectName); err == nil {
+		return InitResponse{}, fmt.Errorf("legacy gs://%s/%s still exists (%d bytes); refusing automatic bootstrap recovery", gcsBucketName, rootTokenObjectName, size)
+	} else if !errors.Is(err, storage.ErrObjectNotExist) {
+		return InitResponse{}, fmt.Errorf("inspect legacy gs://%s/%s: %w", gcsBucketName, rootTokenObjectName, err)
+	}
+
+	if _, err = stat(ctx, bootstrapCompleteObjectName); err == nil {
+		return InitResponse{}, fmt.Errorf("gs://%s/%s already exists; refusing incomplete-bootstrap recovery", gcsBucketName, bootstrapCompleteObjectName)
+	} else if !errors.Is(err, storage.ErrObjectNotExist) {
+		return InitResponse{}, fmt.Errorf("inspect gs://%s/%s: %w", gcsBucketName, bootstrapCompleteObjectName, err)
+	}
+
+	return readRecoveryBundleContents(ctx, read, decrypt)
+}
+
 func verifyRecoveryBundleContents(ctx context.Context, read encryptedSecretReader, decrypt secretDecrypter) error {
+	_, err := readRecoveryBundleContents(ctx, read, decrypt)
+	return err
+}
+
+func readRecoveryBundleContents(ctx context.Context, read encryptedSecretReader, decrypt secretDecrypter) (InitResponse, error) {
 	protectedResponse, err := read(ctx, unsealKeysObjectName)
 	if err != nil {
-		return fmt.Errorf("read encrypted recovery response: %w", err)
+		return InitResponse{}, fmt.Errorf("read encrypted recovery response: %w", err)
 	}
 	recoveryJSON, err := decrypt(ctx, protectedResponse)
 	if err != nil {
-		return fmt.Errorf("decrypt recovery response: %w", err)
+		return InitResponse{}, fmt.Errorf("decrypt recovery response: %w", err)
 	}
 	var recovery InitResponse
 	if err := json.Unmarshal(recoveryJSON, &recovery); err != nil {
-		return fmt.Errorf("decode recovery response: %w", err)
+		return InitResponse{}, fmt.Errorf("decode recovery response: %w", err)
 	}
 	if recovery.RootToken != "" {
-		return fmt.Errorf("encrypted recovery response retains an initial root token; migrate it to the root-token-free schema under dual control")
+		return InitResponse{}, fmt.Errorf("encrypted recovery response retains an initial root token; migrate it to the root-token-free schema under dual control")
 	}
 	if len(recovery.RecoveryKeys) == 0 && len(recovery.RecoveryKeysBase64) == 0 &&
 		len(recovery.Keys) == 0 && len(recovery.KeysBase64) == 0 {
-		return fmt.Errorf("encrypted recovery response contains no recovery or unseal keys")
+		return InitResponse{}, fmt.Errorf("encrypted recovery response contains no recovery or unseal keys")
+	}
+	return recovery, nil
+}
+
+func resumeIncompleteBootstrap(recovery InitResponse, store encryptedSecretStore, wait func(time.Duration)) (err error) {
+	if len(vaultRecoveryPGPKeys) != 0 {
+		return fmt.Errorf("automatic bootstrap recovery is unavailable when recovery shares use PGP custodian custody")
+	}
+	repairToken, err := generateRecoveryRootToken(recovery)
+	if err != nil {
+		return fmt.Errorf("generate temporary recovery root token: %w", err)
+	}
+	repairTokenLive := true
+	defer func() {
+		if !repairTokenLive {
+			return
+		}
+		if revokeErr := revokeInitialRootToken(repairToken); revokeErr != nil {
+			err = errors.Join(err, fmt.Errorf("revoke temporary recovery root token after recovery failure: %w", revokeErr))
+		}
+	}()
+
+	if err = retryEnsureStdoutAuditDevice(repairToken, wait); err != nil {
+		return err
+	}
+	if err = revokeOtherRootTokens(repairToken); err != nil {
+		return err
+	}
+	if err = revokeInitialRootToken(repairToken); err != nil {
+		return fmt.Errorf("revoke temporary recovery root token: %w", err)
+	}
+	if err = verifyInitialRootTokenRevoked(repairToken); err != nil {
+		return fmt.Errorf("verify temporary recovery root token revocation: %w", err)
+	}
+	repairTokenLive = false
+
+	if err = persistBootstrapCompletion(store, wait); err != nil {
+		return err
+	}
+	log.Println("Recovered incomplete secure bootstrap; audit is enabled and all root-policy tokens are revoked.")
+	return nil
+}
+
+func generateRecoveryRootToken(recovery InitResponse) (string, error) {
+	shares := recovery.RecoveryKeysBase64
+	if len(shares) == 0 {
+		shares = recovery.RecoveryKeys
+	}
+	if len(shares) == 0 {
+		return "", fmt.Errorf("KMS recovery bundle contains no Vault recovery keys")
+	}
+	if vaultRecoveryThreshold < 2 || vaultRecoveryThreshold > len(shares) {
+		return "", fmt.Errorf("configured recovery threshold %d is incompatible with %d stored recovery shares", vaultRecoveryThreshold, len(shares))
+	}
+	seenShares := make(map[string]struct{}, len(shares))
+	for _, share := range shares {
+		if strings.TrimSpace(share) == "" {
+			return "", fmt.Errorf("KMS recovery bundle contains an empty recovery share")
+		}
+		if _, duplicate := seenShares[share]; duplicate {
+			return "", fmt.Errorf("KMS recovery bundle contains duplicate recovery shares")
+		}
+		seenShares[share] = struct{}{}
+	}
+
+	status, body, err := doRootVaultRequest(http.MethodGet, "/v1/sys/generate-root/attempt", nil, "")
+	if err != nil {
+		return "", fmt.Errorf("inspect root generation attempt: %w", err)
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("inspect root generation attempt: unexpected status %d", status)
+	}
+	var current rootGenerationStatus
+	if err := json.Unmarshal(body, &current); err != nil {
+		return "", fmt.Errorf("decode root generation attempt: %w", err)
+	}
+	if current.Started {
+		status, _, err = doRootVaultRequest(http.MethodDelete, "/v1/sys/generate-root/attempt", nil, "")
+		if err != nil {
+			return "", fmt.Errorf("cancel stale root generation attempt: %w", err)
+		}
+		if status != http.StatusNoContent {
+			return "", fmt.Errorf("cancel stale root generation attempt: unexpected status %d", status)
+		}
+	}
+
+	status, body, err = doRootVaultRequest(http.MethodPost, "/v1/sys/generate-root/attempt", []byte("{}"), "")
+	if err != nil {
+		return "", fmt.Errorf("start root generation attempt: %w", err)
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("start root generation attempt: unexpected status %d", status)
+	}
+	var attempt rootGenerationStatus
+	if err := json.Unmarshal(body, &attempt); err != nil {
+		return "", fmt.Errorf("decode root generation start: %w", err)
+	}
+	if !attempt.Started || attempt.Nonce == "" || attempt.OTP == "" || attempt.OTPLength != len(attempt.OTP) || attempt.Complete {
+		return "", fmt.Errorf("root generation start returned an invalid nonce or OTP")
+	}
+	if attempt.Required != vaultRecoveryThreshold {
+		return "", fmt.Errorf("vault root generation requires %d shares, but configuration requires %d", attempt.Required, vaultRecoveryThreshold)
+	}
+
+	for _, share := range shares[:attempt.Required] {
+		payload, marshalErr := json.Marshal(map[string]string{"key": share, "nonce": attempt.Nonce})
+		if marshalErr != nil {
+			return "", fmt.Errorf("marshal root generation share: %w", marshalErr)
+		}
+		status, body, err = doRootVaultRequest(http.MethodPost, "/v1/sys/generate-root/update", payload, "")
+		if err != nil {
+			return "", fmt.Errorf("submit root generation share: %w", err)
+		}
+		if status != http.StatusOK {
+			return "", fmt.Errorf("submit root generation share: unexpected status %d", status)
+		}
+		var update rootGenerationStatus
+		if err := json.Unmarshal(body, &update); err != nil {
+			return "", fmt.Errorf("decode root generation update: %w", err)
+		}
+		if update.Nonce != attempt.Nonce || update.Required != attempt.Required {
+			return "", fmt.Errorf("root generation update changed nonce or threshold")
+		}
+		if !update.Complete {
+			continue
+		}
+		return decodeGeneratedRootToken(update.EncodedToken, attempt.OTP)
+	}
+	return "", fmt.Errorf("root generation did not complete after %d recovery shares", attempt.Required)
+}
+
+func decodeGeneratedRootToken(encodedToken, otp string) (string, error) {
+	encoded, err := base64.StdEncoding.DecodeString(encodedToken)
+	if err != nil {
+		return "", fmt.Errorf("decode generated root token: %w", err)
+	}
+	if len(encoded) == 0 || len(encoded) != len(otp) {
+		return "", fmt.Errorf("generated root token and OTP lengths do not match")
+	}
+	decoded := make([]byte, len(encoded))
+	for i := range encoded {
+		decoded[i] = encoded[i] ^ otp[i]
+	}
+	if strings.TrimSpace(string(decoded)) == "" {
+		return "", fmt.Errorf("generated root token is empty")
+	}
+	return string(decoded), nil
+}
+
+func revokeOtherRootTokens(repairToken string) error {
+	self, err := lookupSelfToken(repairToken)
+	if err != nil {
+		return fmt.Errorf("lookup temporary recovery root token: %w", err)
+	}
+	if self.Accessor == "" || !hasPolicy(self.Policies, "root") {
+		return fmt.Errorf("temporary recovery token is not a root-policy token")
+	}
+
+	accessors, err := listTokenAccessors(repairToken)
+	if err != nil {
+		return err
+	}
+	selfListed := false
+	for _, accessor := range accessors {
+		if accessor == self.Accessor {
+			selfListed = true
+			continue
+		}
+		token, lookupErr := lookupTokenAccessor(accessor, repairToken)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if !hasPolicy(token.Policies, "root") {
+			continue
+		}
+		if revokeErr := revokeTokenAccessor(accessor, repairToken); revokeErr != nil {
+			return revokeErr
+		}
+	}
+	if !selfListed {
+		return fmt.Errorf("temporary recovery root accessor was absent from the token accessor list")
+	}
+
+	accessors, err = listTokenAccessors(repairToken)
+	if err != nil {
+		return fmt.Errorf("verify root-token cleanup: %w", err)
+	}
+	for _, accessor := range accessors {
+		if accessor == self.Accessor {
+			continue
+		}
+		token, lookupErr := lookupTokenAccessor(accessor, repairToken)
+		if lookupErr != nil {
+			return fmt.Errorf("verify root-token cleanup: %w", lookupErr)
+		}
+		if hasPolicy(token.Policies, "root") {
+			return fmt.Errorf("verify root-token cleanup: root-policy token %q remains live", accessor)
+		}
 	}
 	return nil
+}
+
+func lookupSelfToken(rootToken string) (tokenData, error) {
+	status, body, err := doRootVaultRequest(http.MethodGet, "/v1/auth/token/lookup-self", nil, rootToken)
+	if err != nil {
+		return tokenData{}, err
+	}
+	if status != http.StatusOK {
+		return tokenData{}, fmt.Errorf("unexpected status %d", status)
+	}
+	var response tokenLookupResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return tokenData{}, fmt.Errorf("decode token lookup: %w", err)
+	}
+	return response.Data, nil
+}
+
+func listTokenAccessors(rootToken string) ([]string, error) {
+	status, body, err := doRootVaultRequest("LIST", "/v1/auth/token/accessors", nil, rootToken)
+	if err != nil {
+		return nil, fmt.Errorf("list token accessors: %w", err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("list token accessors: unexpected status %d", status)
+	}
+	var response tokenAccessorListResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("decode token accessors: %w", err)
+	}
+	return response.Data.Keys, nil
+}
+
+func lookupTokenAccessor(accessor, rootToken string) (tokenData, error) {
+	payload, err := json.Marshal(map[string]string{"accessor": accessor})
+	if err != nil {
+		return tokenData{}, fmt.Errorf("marshal token accessor lookup: %w", err)
+	}
+	status, body, err := doRootVaultRequest(http.MethodPost, "/v1/auth/token/lookup-accessor", payload, rootToken)
+	if err != nil {
+		return tokenData{}, fmt.Errorf("lookup token accessor %q: %w", accessor, err)
+	}
+	if status != http.StatusOK {
+		return tokenData{}, fmt.Errorf("lookup token accessor %q: unexpected status %d", accessor, status)
+	}
+	var response tokenLookupResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return tokenData{}, fmt.Errorf("decode token accessor %q: %w", accessor, err)
+	}
+	if response.Data.Accessor != accessor {
+		return tokenData{}, fmt.Errorf("lookup token accessor %q returned accessor %q", accessor, response.Data.Accessor)
+	}
+	return response.Data, nil
+}
+
+func revokeTokenAccessor(accessor, rootToken string) error {
+	payload, err := json.Marshal(map[string]string{"accessor": accessor})
+	if err != nil {
+		return fmt.Errorf("marshal token accessor revocation: %w", err)
+	}
+	status, _, err := doRootVaultRequest(http.MethodPost, "/v1/auth/token/revoke-accessor", payload, rootToken)
+	if err != nil {
+		return fmt.Errorf("revoke root token accessor %q: %w", accessor, err)
+	}
+	if status != http.StatusNoContent {
+		return fmt.Errorf("revoke root token accessor %q: unexpected status %d", accessor, status)
+	}
+	return nil
+}
+
+func hasPolicy(policies []string, wanted string) bool {
+	for _, policy := range policies {
+		if policy == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func verifyBootstrapCompletion(ctx context.Context, read encryptedSecretReader) error {

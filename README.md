@@ -30,17 +30,24 @@ Vault accepting `/v1/sys/init` and the "Initialization complete" log entry.
 Every run that finds Vault already initialized verifies the encrypted recovery
 bundle, proves that it contains no root token, validates the bootstrap marker,
 and fails if the legacy `root-token.enc` object exists. A crash after the
-recovery bundle becomes durable but before audit/root revocation completes
-requires a recovery-key-quorum operator repair; an automated retry cannot and
-must not recover a durable root token. If `unseal-keys.json.enc` or
-`bootstrap-complete.json` is missing, the process exits nonzero rather than
-silently claiming success. The
+recovery bundle becomes durable but before audit/root revocation completes is
+resumed automatically when the bundle is protected only by KMS. The retry
+decrypts the root-token-free recovery shares, generates a temporary root token,
+enables and verifies audit, revokes every other root-policy token left by the
+interrupted bootstrap, revokes and verifies the temporary token, and only then
+writes `bootstrap-complete.json`. This recovery is fail-closed: it is refused
+when the completion object already exists, the recovery bundle is missing,
+empty, malformed, or retains a root token, the legacy `root-token.enc` object
+exists, or PGP custodian custody is configured. PGP-protected shares still
+require the configured custodian quorum. Audit setup itself uses a bounded retry
+to bridge transient Vault startup failures while the initial token remains only
+in process memory. The
 default Cloud Run Job policy [retries a failed task three
 times](https://cloud.google.com/run/docs/configuring/max-retries). Those retries
-can bridge transient GCS errors, but they cannot repair a missing recovery
-bundle. Configure a task timeout long enough for the post-initialization retry
-loop because forced termination or task timeout can still interrupt secure
-bootstrap.
+can bridge transient Vault, KMS, and GCS errors, but they cannot repair a
+missing recovery bundle. Configure a task timeout long enough for the
+post-initialization retry loop because forced termination or task timeout can
+still interrupt secure bootstrap.
 
 For auto-unseal, the default is five recovery shares with a threshold of three.
 By default Vault returns those shares to the initializer, which removes the
