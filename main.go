@@ -746,10 +746,20 @@ func readAuditDevices(rootToken string) (map[string]auditDevice, error) {
 		return nil, fmt.Errorf("unexpected status %d", status)
 	}
 	var devices map[string]auditDevice
-	if err := json.Unmarshal(body, &devices); err != nil {
-		return nil, fmt.Errorf("decode audit devices: %w", err)
+	directErr := json.Unmarshal(body, &devices)
+	if directErr == nil {
+		return devices, nil
 	}
-	return devices, nil
+	var response struct {
+		Data map[string]auditDevice `json:"data"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("decode audit devices response: %w", err)
+	}
+	if response.Data == nil {
+		return nil, fmt.Errorf("decode audit devices: %w", directErr)
+	}
+	return response.Data, nil
 }
 
 func validateStdoutAuditDevice(device auditDevice) error {
