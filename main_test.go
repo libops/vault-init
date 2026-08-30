@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -684,7 +685,7 @@ func TestSecureBootstrapEnablesAuditBeforeRevokingRoot(t *testing.T) {
 				_, _ = response.Write([]byte(`{}`))
 				return
 			}
-			_, _ = response.Write([]byte(`{"request_id":"audit-list","lease_id":"","renewable":false,"lease_duration":0,"data":{"cloudrun/":{"type":"file","options":{"file_path":"stdout","log_raw":"false"}}},"wrap_info":null,"warnings":null,"auth":null,"mount_type":"system"}`))
+			_, _ = response.Write([]byte(`{"request_id":"audit-list","lease_id":"","renewable":false,"lease_duration":0,"data":{"cloudrun/":{"type":"file","options":{"file_path":"stdout","format":"json","hmac_accessor":"true","log_raw":"false","elide_list_responses":"true"}}},"wrap_info":null,"warnings":null,"auth":null,"mount_type":"system"}`))
 		case "POST /v1/sys/audit/cloudrun":
 			events = append(events, "audit")
 			auditEnabled = true
@@ -719,6 +720,42 @@ func TestSecureBootstrapEnablesAuditBeforeRevokingRoot(t *testing.T) {
 	}
 }
 
+func TestValidateStdoutAuditDeviceRequiresProtectedStructuredOptions(t *testing.T) {
+	valid := auditDevice{
+		Type: "file",
+		Options: map[string]string{
+			"file_path":            "stdout",
+			"format":               "json",
+			"hmac_accessor":        "true",
+			"log_raw":              "false",
+			"elide_list_responses": "true",
+		},
+	}
+	if err := validateStdoutAuditDevice(valid); err != nil {
+		t.Fatalf("valid protected audit device rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		option string
+		value  string
+	}{
+		{name: "non-JSON format", option: "format", value: "jsonx"},
+		{name: "unhashed accessors", option: "hmac_accessor", value: "false"},
+		{name: "raw secrets", option: "log_raw", value: "true"},
+		{name: "unbounded list bodies", option: "elide_list_responses", value: "false"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			device := auditDevice{Type: valid.Type, Options: maps.Clone(valid.Options)}
+			device.Options[test.option] = test.value
+			if err := validateStdoutAuditDevice(device); err == nil {
+				t.Fatalf("unsafe %s=%q audit device accepted", test.option, test.value)
+			}
+		})
+	}
+}
+
 func TestSecureBootstrapRetriesTransientAuditFailure(t *testing.T) {
 	originalVaultAddr := vaultAddr
 	originalHTTPClient := httpClient
@@ -747,7 +784,7 @@ func TestSecureBootstrapRetriesTransientAuditFailure(t *testing.T) {
 				response.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			_, _ = response.Write([]byte(`{"cloudrun/":{"type":"file","options":{"file_path":"stdout","log_raw":"false"}}}`))
+			_, _ = response.Write([]byte(`{"cloudrun/":{"type":"file","options":{"file_path":"stdout","format":"json","hmac_accessor":"true","log_raw":"false","elide_list_responses":"true"}}}`))
 		case "POST /v1/auth/token/revoke-self":
 			rootRevoked = true
 			response.WriteHeader(http.StatusNoContent)
@@ -967,7 +1004,7 @@ func TestResumeIncompleteKMSBootstrap(t *testing.T) {
 			}
 			writeJSON(response, map[string]any{
 				"cloudrun/": map[string]any{
-					"type": "file", "options": map[string]string{"file_path": "stdout", "log_raw": "false"},
+					"type": "file", "options": protectedStdoutAuditOptions(),
 				},
 			})
 		case "POST /v1/sys/audit/cloudrun":

@@ -708,13 +708,7 @@ func ensureStdoutAuditDevice(rootToken string) error {
 	payload, err := json.Marshal(map[string]any{
 		"type":        "file",
 		"description": "Cloud Run stdout audit stream",
-		"options": map[string]string{
-			"file_path":            "stdout",
-			"format":               "json",
-			"hmac_accessor":        "true",
-			"log_raw":              "false",
-			"elide_list_responses": "true",
-		},
+		"options":     protectedStdoutAuditOptions(),
 	})
 	if err != nil {
 		return fmt.Errorf("marshal audit configuration: %w", err)
@@ -735,6 +729,16 @@ func ensureStdoutAuditDevice(rootToken string) error {
 		return fmt.Errorf("verify stdout audit device: cloudrun/ is absent")
 	}
 	return validateStdoutAuditDevice(device)
+}
+
+func protectedStdoutAuditOptions() map[string]string {
+	return map[string]string{
+		"file_path":            "stdout",
+		"format":               "json",
+		"hmac_accessor":        "true",
+		"log_raw":              "false",
+		"elide_list_responses": "true",
+	}
 }
 
 func readAuditDevices(rootToken string) (map[string]auditDevice, error) {
@@ -763,9 +767,13 @@ func readAuditDevices(rootToken string) (map[string]auditDevice, error) {
 }
 
 func validateStdoutAuditDevice(device auditDevice) error {
-	if device.Type != "file" || device.Options["file_path"] != "stdout" ||
-		device.Options["log_raw"] == "true" {
-		return fmt.Errorf("cloudrun/ audit device must be file output to stdout with raw secret logging disabled")
+	if device.Type != "file" {
+		return fmt.Errorf("cloudrun/ audit device type %q must be file", device.Type)
+	}
+	for name, want := range protectedStdoutAuditOptions() {
+		if got := device.Options[name]; got != want {
+			return fmt.Errorf("cloudrun/ audit device option %s=%q must be %q", name, got, want)
+		}
 	}
 	return nil
 }
