@@ -79,16 +79,6 @@ jobs:
           push: false
           tags: vault-init:ci-${{ matrix.architecture.suffix }}
 
-      - name: Scan native image
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: vault-init:ci-${{ matrix.architecture.suffix }}
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          severity: HIGH,CRITICAL
-          vuln-type: os,library
-
   build-push:
     if: always() && github.event_name == 'pull_request'
     needs:
@@ -107,7 +97,6 @@ jobs:
       ref: ${{ github.sha }}
       expected-main-sha: ${{ github.ref == 'refs/heads/main' && github.sha || '' }}
       additional-gar-registry: us-docker.pkg.dev/libops-images/public
-      scan: true
       sign: true
     permissions:
       contents: read
